@@ -1,0 +1,33 @@
+{
+  "amazon.com": {
+    "account": "buyer-account@example.com",
+    "password": "the-password",
+    "totp_secret": "JBSWY3DPEHPK3PXP",
+    "note": "美国专用小号;totp_secret 是开两步验证时『无法扫描?』显示的字母密钥,可省略"
+  },
+  "amazon.com.mx": {
+    "account": "buyer-account@example.com",
+    "password": "the-password",
+    "note": "墨西哥专用小号"
+  },
+  "amazon.com.br": {
+    "account": "buyer-account@example.com",
+    "password": "the-password",
+    "note": "巴西专用小号"
+  },
+  "amazon.in": {
+    "account": "buyer-account@example.com",
+    "password": "the-password",
+    "note": "印度专用小号"
+  },
+  "amazon.com.au": {
+    "account": "buyer-account@example.com",
+    "password": "the-password",
+    "note": "澳洲专用小号"
+  },
+  "amazon.co.jp": {
+    "account": "buyer-account@example.com",
+    "password": "the-password",
+    "note": "日本专用小号"
+  }
+}

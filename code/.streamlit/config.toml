@@ -1,0 +1,14 @@
+# Streamlit 项目配置
+[server]
+runOnSave = true          # 代码保存即热更新,所有已打开的页面自动重载
+
+[client]
+toolbarMode = "minimal"   # 隐藏 Deploy 按钮和开发者菜单(内网工具用不上)
+
+[theme]
+base = "light"
+primaryColor = "#FF9900"              # Amazon 橙
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F8FA"
+textColor = "#1F2937"
+font = "sans serif"

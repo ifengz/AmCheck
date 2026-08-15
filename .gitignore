@@ -1,0 +1,20 @@
+# 工作过程文档(不上传)
+/doc/lessons.md
+/doc/task_plan.md
+/doc/progress.md
+/doc/findings.md
+/doc/test/
+
+# Python
+__pycache__/
+*.pyc
+code/.venv/
+
+# 运行时数据与敏感信息
+code/accounts.json
+code/history.db
+code/screenshots/
+code/graphify-out/
+
+# 系统
+.DS_Store
