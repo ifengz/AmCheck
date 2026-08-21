@@ -4,8 +4,8 @@
 #   SSH_USER         登录用户(宝塔一般 root)
 #   SSH_PORT         SSH 端口(默认 22)
 #   SSH_PRIVATE_KEY  服务器登录私钥(ed25519 完整内容)
-#   DEPLOY_PATH      服务器项目目录(宝塔 Python 项目管理器里的项目路径,末尾不带 /)
-# 示例:rsync 同步到 /www/wwwroot/amcheck/,该目录内直接是 app.py
+#   DEPLOY_PATH      宝塔站点目录,示例: /www/wwwroot/amcheck.usfan.net (该目录内直接是 app.py)
+# 访问入口: https://amcheck.usfan.net → Nginx 反代到 127.0.0.1:8765
 
 name: 部署到宝塔
 
