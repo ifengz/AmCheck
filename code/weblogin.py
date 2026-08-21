@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from pathlib import Path
@@ -13,6 +14,11 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 PROFILE_ROOT = Path.home() / ".amreview" / "profile"
+
+
+def _browser_args() -> list[str]:
+    """服务器常以 root 运行浏览器,不带 --no-sandbox 会被 Chromium/Chrome 拒绝启动。"""
+    return ["--no-sandbox"] if hasattr(os, "geteuid") and os.geteuid() == 0 else []
 # 各市场登录 cookie 后缀不同(at-main/x-main 为主,日本/中国等为 at-jp/at-cn 等),按前缀判定
 def _is_login_cookie(name: str) -> bool:
     return name.startswith("at-") or name.startswith("x-")
@@ -21,7 +27,8 @@ def _is_login_cookie(name: str) -> bool:
 FILL_FIELDS = {
     "email": ["#ap_email", 'input[name="email"]'],
     "password": ["#ap_password", 'input[type="password"]'],
-    "otp": ["#auth-mfa-otpcode", 'input[name="otpCode"]'],
+    "otp": ["#auth-mfa-otpcode", 'input[name="otpCode"]',
+            'input[autocomplete="one-time-code"]'],  # 含印度站等变体
     "captcha": ["#auth-captcha-guess", 'input[name="guess"]'],
 }
 # 各步的提交按钮(点第一个可见的;隐藏的不点,避免在密码页误点 email 页的 continue)
@@ -60,7 +67,8 @@ class LoginSession:
         self.profile.mkdir(parents=True, exist_ok=True)
         self.pw = sync_playwright().start()
         kwargs = dict(user_data_dir=str(self.profile), headless=True,
-                      locale="en-US", viewport={"width": 1280, "height": 900})
+                      locale="en-US", viewport={"width": 1280, "height": 900},
+                      args=_browser_args())
         try:
             self.ctx = self.pw.chromium.launch_persistent_context(channel="chrome", **kwargs)
         except Exception:
@@ -197,8 +205,14 @@ def get_session(domain: str) -> LoginSession:
     return sess
 
 
+def close_domains(domains: set[str]) -> None:
+    """关闭指定域名的登录会话,释放档案给检测引擎;不影响其他域名的会话。"""
+    for d in domains:
+        sess = ACTIVE.pop(d, None)
+        if sess:
+            sess.close()
+
+
 def close_all():
-    """开始检测前调用:释放所有档案,避免持久化目录被登录浏览器占用。"""
-    for sess in ACTIVE.values():
-        sess.close()
-    ACTIVE.clear()
+    """关闭全部登录会话(等价于 close_domains 传所有域名)。"""
+    close_domains(set(ACTIVE))

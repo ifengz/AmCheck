@@ -14,7 +14,7 @@
 | `engine.py` | 检测引擎:URL 规范化 + 状态机判定 + 字段提取,可独立 CLI 使用 |
 | `weblogin.py` | 网页引导登录:服务器端浏览器 + 登录页截图推流 + 验证码中继 |
 | `login.py` | 命令行引导登录(本机调试/SSH X11 用,网页登录的替代品) |
-| `accounts.json` | 各站点小号凭据(复制 `accounts.json.example` 填写;网页上会展示账号/密码/二维码) |
+| `accounts.json` | 各站点 Amazon 账号凭据(复制 `accounts.json.example` 填写;网页上会展示账号/密码/二维码) |
 | `history.db` | 检测历史(自动创建) |
 | `screenshots/` | 已删/未知/被拦项截图证据(自动创建) |
 
@@ -22,20 +22,21 @@
 
 登录一次,长期保存(存服务器 `~/.amreview/profile/<域名>/`,通常数周才失效一次)。打开网站首页 → 展开「🍪 引导登录」:
 
-1. 选站点,页面**直接显示该站小号账号、密码和二维码**(凭据来自服务器 `code/accounts.json`,谁打开网站谁就能登;未配置则手动填面板里的账号/密码输入框,效果相同)
+1. 选站点,页面**直接显示该站 Amazon 账号、密码和二维码**(凭据来自服务器 `code/accounts.json`,谁打开网站谁就能登;未配置则手动填面板里的账号/密码输入框,效果相同)
 2. 点「🚀 开始登录」→ 服务器浏览器自动:打开登录页 → 填账号 → 填密码 → 提交,页面同步显示实时截图
-3. 若停在 OTP / 图片验证码页 → 在输入框填码,点「提交验证码」中继到服务器浏览器。**配了 TOTP 密钥则此步全自动**:小号在 Amazon「登录与安全 → 两步验证」选「验证器 App」,二维码下方点「无法扫描二维码?」会显示一串字母密钥,填进 `accounts.json` 的 `totp_secret`(或网页上的 TOTP 输入框),OTP 由服务器自己算自己填
+3. 若停在 OTP / 图片验证码页 → 在输入框填码,点「提交验证码」中继到服务器浏览器。**配了 TOTP 密钥则此步全自动**:Amazon 账号在「登录与安全 → 两步验证」选「验证器 App」,二维码下方点「无法扫描二维码?」会显示一串字母密钥,填进 `accounts.json` 的 `totp_secret`(或网页上的 TOTP 输入框),OTP 由服务器自己算自己填
 4. 检测到 `at-main`/`x-main` cookie 自动保存,提示 ✅ 完成;之后所有检测静默复用
 
 检测结果出现 🍪 登录失效时,页面会点名哪些站点需要重新登录,展开面板重复上述步骤即可。
 
 > 内网站点,凭据对打开网站的人可见——按需配置;不配 accounts.json 也可用 ①③ 手动步骤登录。
+> 可选加固:设置环境变量 `AMREVIEW_PANEL_PASSWORD`(或 accounts.json 顶层加 `"_panel_password": "口令"`),登录面板需输入口令才能查看凭据与操作。
 
 ## 本机使用
 
 ```bash
 cd code
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements.lock.txt  # 有锁文件用锁文件,可复现
 .venv/bin/streamlit run app.py
 # 或不用网页,直接命令行检测
 .venv/bin/python engine.py "https://www.amazon.com/gp/customer-reviews/RXXXX/"
@@ -45,7 +46,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 1. **Python 项目管理器**(宝塔软件商店,Python 3.10+),上传 `code/` 目录,添加项目:框架 Streamlit、启动文件 `app.py`、端口 `8765`
 2. 项目虚拟环境里执行一次:`playwright install chromium`;有条件再 `apt install google-chrome-stable`(Chrome 穿 Amazon 守卫已实测,Chromium 是兜底)
-3. 复制 `accounts.json.example` 为 `accounts.json`,填入各站点小号凭据
+3. 复制 `accounts.json.example` 为 `accounts.json`,填入各站点 Amazon 账号凭据
 4. **Nginx 反代**:网站 → 添加站点 → 反向代理到 `http://127.0.0.1:8765`;若进度条不动,反代配置加 WebSocket 支持:
    ```nginx
    proxy_http_version 1.1;

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import time
@@ -22,6 +23,11 @@ from playwright.sync_api import Page, sync_playwright
 
 PROFILE_ROOT = Path.home() / ".amreview" / "profile"
 SHOT_DIR = Path(__file__).parent / "screenshots"
+
+
+def _browser_args() -> list[str]:
+    """服务器常以 root 运行浏览器,不带 --no-sandbox 会被 Chromium/Chrome 拒绝启动。"""
+    return ["--no-sandbox"] if hasattr(os, "geteuid") and os.geteuid() == 0 else []
 
 STATUS_LABEL = {
     "alive": "✅ 正常",
@@ -53,6 +59,8 @@ DELETED_TEXTS = (
 
 MAX_RETRY = 3          # Server Busy / guard 各自的重试上限
 BACKOFFS = (8, 20, 40)  # guard 退避秒数
+# 登录墙判定:实测 Amazon 存在 ap/signin 与 gp/sign-in.html 两种跳转形态
+SIGNIN_PATHS = ("/ap/signin", "/gp/sign-in.html")
 
 
 @dataclass
@@ -126,7 +134,7 @@ def _txt(page: Page, selector: str) -> str:
 
 
 def _shot(page: Page, shot_dir: Path, review_id: str) -> str:
-    path = shot_dir / f"{review_id}_{int(time.time())}.png"
+    path = shot_dir / f"{review_id}_{int(time.time() * 1000)}.png"  # 毫秒级,避免同秒重查覆盖
     try:
         page.screenshot(path=str(path))
         return str(path)
@@ -219,13 +227,13 @@ def check_one(page: Page, ref: ReviewRef, shot_dir: Path) -> dict:
             continue
         final_url, title = page.url, page.title()
 
-        if "/ap/signin" in final_url:
+        if any(p in final_url for p in SIGNIN_PATHS):
             if not signin_warmed:
                 signin_warmed = True
                 _warmup(page, ref.domain)
                 continue
             result.update(status="login_expired",
-                          note="跳转登录页,需重新引导登录该站点小号")
+                          note="跳转登录页,需重新引导登录该站点 Amazon 账号")
             return result
 
         body = ""
@@ -294,7 +302,8 @@ class ReviewChecker:
             profile = self.profile_root / domain
             profile.mkdir(parents=True, exist_ok=True)
             kwargs = dict(user_data_dir=str(profile), headless=self.headless,
-                          locale="en-US", viewport={"width": 1280, "height": 900})
+                          locale="en-US", viewport={"width": 1280, "height": 900},
+                          args=_browser_args())
             # 优先本机 Chrome(实测可穿 edgex guard),无 Chrome 环境回退内置 Chromium
             try:
                 ctx = self._pw.chromium.launch_persistent_context(channel="chrome", **kwargs)

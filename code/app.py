@@ -1,7 +1,7 @@
 """AmReview Streamlit 主页:粘贴评价链接 → 批量检测 → 结果 + CSV。
 
 布局规范(公共组件,不手搓):
-- 顶栏:标题 + 站点登录状态灯 + 「小号登录」按钮(弹窗 @st.dialog)
+- 顶栏:标题 + 站点登录状态灯 + 「Amazon 账号登录」按钮(弹窗 @st.dialog)
 - 热度条:近 24h 各站拦截率色点(🟢🟡🔴)
 - 卡片:st.container(border=True) + st.metric,统一留白
 """
@@ -12,14 +12,17 @@ import csv
 import importlib.metadata
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import weblogin
 from engine import STATUS_LABEL, ReviewChecker, parse_links
@@ -29,42 +32,19 @@ ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
 PROFILE_ROOT = Path.home() / ".amreview" / "profile"
 DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
            "amazon.com.au", "amazon.co.jp"]
-LOGIN_VALID_DAYS = 30  # storage_state 超过此天数视为可能过期,仍算"绿"但标时间
 
 st.set_page_config(page_title="AmReview 评价检测", page_icon="🔍", layout="wide")
-
-# 轻量全局样式:压缩默认留白,metric 数字放大,状态徽章,Tab 优化
-st.markdown("""
-<style>
-  .block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1200px;}
-  [data-testid="stMetric"] {background:#F7F8FA; border:1px solid #E5E7EB;
-    border-radius:10px; padding:12px 14px; transition: all 0.2s ease;}
-  [data-testid="stMetric"]:hover {box-shadow: 0 2px 8px rgba(0,0,0,0.08);}
-  [data-testid="stMetricLabel"] {font-size:.82rem; color:#6B7280;}
-  [data-testid="stMetricValue"] {font-size:1.45rem; font-weight:700;}
-  .status-badge {display:inline-block; padding:3px 10px; border-radius:12px;
-    font-size:.75rem; font-weight:600; margin:2px 4px;}
-  .badge-online {background:#D1FAE5; color:#065F46;}
-  .badge-offline {background:#F3F4F6; color:#6B7280;}
-  .badge-old {background:#FEF3C7; color:#92400E;}
-  /* 优化表格样式 */
-  [data-testid="stDataFrame"] {border-radius:8px; overflow:hidden;}
-  /* 优化容器边框 */
-  [data-testid="stHorizontalBlock"] > div[data-testid="column"] > div {border-radius:10px;}
-  /* Tab 标签页优化 */
-  .stTabs [data-baseweb="tab-list"] {gap: 8px; background:#F9FAFB; padding:8px;
-    border-radius:12px; margin-bottom:1rem;}
-  .stTabs [data-baseweb="tab"] {height: 50px; background:#FFF; border-radius:8px;
-    padding: 0 24px; font-weight:500; transition: all 0.2s;}
-  .stTabs [aria-selected="true"] {background:#FF9900; color:#FFF;}
-  .stTabs [data-baseweb="tab"]:hover {box-shadow: 0 2px 6px rgba(0,0,0,0.08);}
-</style>""", unsafe_allow_html=True)
 
 
 # ---------- 数据层 ----------
 
+def _db() -> sqlite3.Connection:
+    """带超时的连接:多会话并发写时避免偶发 database is locked。"""
+    return sqlite3.connect(DB, timeout=10)
+
+
 def init_db():
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         # 评价检测历史表(当前使用)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS history (
@@ -88,7 +68,7 @@ def last_status_map(refs):
     if not refs or not DB.exists():
         return {}
     ids = [r.review_id for r in refs]
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         rows = conn.execute(
             """SELECT review_id, status, checked_at FROM history h
                WHERE checked_at = (SELECT MAX(checked_at) FROM history
@@ -100,7 +80,7 @@ def last_status_map(refs):
 
 
 def save_history(results):
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         conn.executemany(
             """INSERT INTO history (review_id, domain, url, status, stars, title,
                author, review_date, note, checked_at)
@@ -114,7 +94,7 @@ def heat_stats():
     """近 24h 各站拦截率 —— IP 被加热的早期信号。"""
     if not DB.exists():
         return []
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         return conn.execute("""
             SELECT domain, COUNT(*), SUM(status='blocked')
             FROM history WHERE checked_at >= datetime('now','-1 day')
@@ -122,36 +102,37 @@ def heat_stats():
 
 
 def login_status() -> dict[str, dict]:
-    """各站点登录状态(结构化,展示由渲染层决定):{domain: {"ok": bool, "days": int|None}}"""
+    """各站点登录状态(结构化,展示由渲染层决定):{domain: {"ok": bool, "days": int|None}}
+
+    判定依据:storage_state.json 里是否存在未过期的 at-/x- 登录 cookie。
+    只看文件时间只能证明"登录过",不能证明 cookie 还活着。
+    """
     out = {}
+    now = time.time()
     for d in DOMAINS:
         ss = PROFILE_ROOT / d / "storage_state.json"
         if ss.exists():
-            out[d] = {"ok": True,
-                      "days": int((time.time() - ss.stat().st_mtime) / 86400)}
+            ok = False
+            try:
+                cookies = json.loads(ss.read_text()).get("cookies", [])
+                ok = any(
+                    c.get("name", "").startswith(("at-", "x-"))
+                    and (c.get("expires", -1) < 0 or c.get("expires", 0) > now)
+                    for c in cookies
+                )
+            except Exception:
+                pass
+            out[d] = {"ok": ok, "days": int((now - ss.stat().st_mtime) / 86400)}
         else:
             out[d] = {"ok": False, "days": None}
     return out
-
-
-def status_badges_html(status: dict[str, dict]) -> str:
-    """站点登录状态徽章(登录弹窗/设置页共用,数据与展示分离)"""
-    badges = []
-    for d, s in status.items():
-        short = d.replace("amazon.", "")
-        if s["ok"]:
-            cls = "badge-online" if s["days"] < LOGIN_VALID_DAYS else "badge-old"
-            badges.append(f'<span class="status-badge {cls}">{short} ✓ {s["days"]}d</span>')
-        else:
-            badges.append(f'<span class="status-badge badge-offline">{short} ○</span>')
-    return "".join(badges)
 
 
 def recent_history(limit: int = 50):
     """最近 N 条检测记录(历史 Tab 用)"""
     if not DB.exists():
         return []
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         return conn.execute("""
             SELECT review_id, domain, status, title, checked_at
             FROM history ORDER BY checked_at DESC LIMIT ?""", (limit,)).fetchall()
@@ -161,7 +142,7 @@ def history_stats():
     """全量状态分布统计(历史 Tab 用)"""
     if not DB.exists():
         return []
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         return conn.execute(
             "SELECT status, COUNT(*) FROM history GROUP BY status").fetchall()
 
@@ -170,7 +151,7 @@ def db_info():
     """数据库大小与记录数(设置 Tab 用);未创建时返回 None"""
     if not DB.exists():
         return None
-    with sqlite3.connect(DB) as conn:
+    with _db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
     return DB.stat().st_size / 1024, count
 
@@ -192,6 +173,14 @@ def load_accounts() -> dict:
 ACCOUNTS = load_accounts()
 
 
+def _panel_password() -> str:
+    """登录面板访问口令:环境变量优先,其次 accounts.json 顶层 _panel_password 键;未配置则不开门禁。"""
+    pw = os.environ.get("AMREVIEW_PANEL_PASSWORD", "").strip()
+    if not pw:
+        pw = str(ACCOUNTS.get("_panel_password", "")).strip()
+    return pw
+
+
 # ---------- 系统维护弹窗(升级 Playwright 等) ----------
 
 def _run_stream(cmd: list[str], out: st.delta_generator.DeltaGenerator) -> int:
@@ -207,19 +196,114 @@ def _run_stream(cmd: list[str], out: st.delta_generator.DeltaGenerator) -> int:
     return proc.returncode
 
 
-@st.dialog("⚙️ 系统维护")
+def _interp() -> str | None:
+    """当前解释器;路径已失效(如项目目录被重命名)时返回 None,提示重启。"""
+    exe = sys.executable
+    if exe and Path(exe).exists():
+        return exe
+    return None
+
+
+def _latest_pypi(pkg: str) -> tuple[str, str] | None:
+    """查 PyPI:返回 (当前 Python 可装的最新版, 全平台最新版)。
+    会话内缓存 10 分钟(弹窗每次重跑都会调用,不能裸查)。
+    失败(离线/被墙)返回 None,不影响后续升级——pip 自己还会再查一次。
+    注:不能只看 info.version,如 playwright 1.61+ 要求 Python≥3.10,
+    在 3.9 环境里 pip 会自动过滤,pip 视角的"最新"是 1.60.0。"""
+    key = f"pypi_latest_{pkg}"
+    hit = st.session_state.get(key)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    result = None
+    try:
+        import packaging.specifiers, packaging.version
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/json", timeout=5) as r:
+            data = json.load(r)
+        top = data["info"]["version"]
+        cur_py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        compat = top
+        for v in sorted(data["releases"], key=packaging.version.Version, reverse=True):
+            rps = {f.get("requires_python") for f in data["releases"][v]}
+            if any(not rp or packaging.specifiers.SpecifierSet(rp).contains(cur_py) for rp in rps):
+                compat = v
+                break
+        result = (compat, top)
+    except Exception:
+        pass
+    st.session_state[key] = (time.time(), result)
+    return result
+
+
+def _restart_service(py: str) -> None:
+    """网页一键重启:拉起脱离本进程的"保姆"子进程,由它负责
+    杀掉当前服务 → 等端口释放 → 重新 streamlit run。
+    宝塔等有守护的场景:守护会自动拉起,保姆检测到端口被占就退出,不会起双份。"""
+    port = st.config.get_option("server.port") or 8501
+    app_path = Path(__file__).resolve()
+    helper = (
+        "import os, signal, socket, subprocess, sys, time\n"
+        f"me = {os.getpid()}\n"
+        f"cmd = [{py!r}, '-m', 'streamlit', 'run', {str(app_path)!r}, '--server.port', {str(port)!r}]\n"
+        f"cwd = {str(app_path.parent)!r}\n"
+        "time.sleep(1)\n"                       # 给页面留时间收到"正在重启"提示
+        "try:\n"
+        "    os.kill(me, signal.SIGTERM)\n"     # 温和停止,等价于 Ctrl-C
+        "except ProcessLookupError:\n"
+        "    pass\n"
+        "for _ in range(100):\n"                # 等旧进程退出(≤20s)
+        "    try:\n"
+        "        os.kill(me, 0); time.sleep(0.2)\n"
+        "    except ProcessLookupError:\n"
+        "        break\n"
+        "for _ in range(150):\n"                # 等端口释放(≤30s);被占说明守护已拉起
+        "    s = socket.socket()\n"
+        "    try:\n"
+        f"        s.connect(('127.0.0.1', {port})); s.close(); time.sleep(0.2)\n"
+        "    except OSError:\n"
+        "        s.close(); break\n"
+        "else:\n"
+        "    sys.exit(0)\n"
+        "log = open('/tmp/amcheck_restart.log', 'ab')\n"
+        "subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,\n"
+        "                 start_new_session=True)\n"
+    )
+    subprocess.Popen([py, "-c", helper], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@st.dialog("系统维护")
 def system_dialog():
     try:
         cur = importlib.metadata.version("playwright")
     except Exception:
         cur = "未知"
-    st.markdown(f"**Playwright 当前版本:** `{cur}`")
-    st.caption("升级 = 更新 pip 包 + 下载匹配的 Chromium,几分钟;完成后需重启服务生效"
-               "(宝塔:项目管理器重启;本地:Ctrl-C 后重新 streamlit run)")
+    latest = _latest_pypi("playwright")
+    ver_line = f"**Playwright 当前版本:** `{cur}`"
+    if latest:
+        compat, top = latest
+        ver_line += f" · 可装最新版: `{compat}`"
+        if compat != top:
+            ver_line += (f"(PyPI 最新 `{top}` 需更高 Python 版本,"
+                         f"当前 {sys.version_info.major}.{sys.version_info.minor})")
+    st.markdown(ver_line)
+    info = db_info()
+    if info:
+        st.caption(f"数据库: {info[0]:.1f} KB · {info[1]} 条记录")
+    st.caption("升级 = 更新 pip 包 + 下载匹配的 Chromium,几分钟;完成后点下方按钮重启生效"
+               "(也可宝塔项目管理器重启 / 本地 Ctrl-C 后重新 streamlit run)")
 
-    if st.button("⬆️ 一键升级 Playwright", type="primary", use_container_width=True):
-        ok1 = _run_stream([sys.executable, "-m", "pip", "install", "-U", "playwright"], st)
-        ok2 = _run_stream([sys.executable, "-m", "playwright", "install", "chromium"], st)
+    if st.button("升级 Playwright", type="primary", use_container_width=True):
+        py = _interp()
+        if py is None:
+            st.error(f"❌ 当前服务的解释器路径已失效:`{sys.executable}`"
+                     "——项目目录被重命名/移动后服务未重启。"
+                     "请 Ctrl-C 停掉服务,在新目录下重新 `streamlit run app.py`。")
+            return
+        if latest and latest[0] == cur:
+            st.success(f"✅ 已是当前 Python 环境可装的最新版本 {cur},无需升级")
+            return
+        ok1 = _run_stream([py, "-m", "pip", "install", "-U", "playwright"], st)
+        ok2 = _run_stream([py, "-m", "playwright", "install", "chromium"], st)
         new = "未知"
         try:
             new = importlib.metadata.version("playwright")
@@ -230,7 +314,7 @@ def system_dialog():
             code = ("from playwright.sync_api import sync_playwright;"
                     "p=sync_playwright().start();b=p.chromium.launch();"
                     "b.close();p.stop();print('浏览器启动自检 OK')")
-            chk = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+            chk = subprocess.run([py, "-c", code], capture_output=True, text=True)
             if chk.returncode == 0:
                 st.success(f"✅ 升级完成:{cur} → {new};浏览器自检通过。"
                            f"**重启服务后生效**")
@@ -241,40 +325,103 @@ def system_dialog():
             st.error(f"❌ 升级命令失败(pip:{ok1},chromium:{ok2}),"
                      f"看上方输出定位;服务器无法联网时属正常,可稍后再试")
 
+    st.divider()
+    if st.button("重启服务(升级后需重启生效)", use_container_width=True):
+        py = _interp()
+        if py is None:
+            st.error(f"❌ 解释器路径已失效(`{sys.executable}`),无法自动重启;"
+                     "请手动停掉服务后在新目录重新 `streamlit run app.py`。")
+            return
+        _restart_service(py)
+        st.warning("🔄 服务正在重启,页面约 6 秒后自动恢复;若未恢复请手动刷新。")
+        components.html("<script>setTimeout(() => location.reload(), 6000)</script>",
+                        height=0)
+
 
 # ---------- 登录弹窗(公共组件 @st.dialog,不手搓) ----------
 
-@st.dialog("🍪 小号登录管理", width="large")
+# 站点中文名(登录入口展示用;结果表格等其他位置仍用短域名)
+DOMAIN_LABELS = {
+    "amazon.com": "美国站",
+    "amazon.com.mx": "墨西哥站",
+    "amazon.com.br": "巴西站",
+    "amazon.in": "印度站",
+    "amazon.com.au": "澳洲站",
+    "amazon.co.jp": "日本站",
+}
+# 登录入口的站点按钮展示顺序(业务习惯,不按域名排序)
+DOMAIN_ORDER = ["amazon.in", "amazon.com", "amazon.com.au",
+                "amazon.co.jp", "amazon.com.br", "amazon.com.mx"]
+
+
+@st.dialog("Amazon 账号登录管理", width="medium")
 def login_dialog():
-    st.caption("浏览器与登录态全在服务器端 · 登录一次长期有效 · 检测出现 🍪 时来这里重登")
-    st.markdown("**站点登录状态:** " + status_badges_html(login_status()),
-                unsafe_allow_html=True)
+    gate = _panel_password()
+    if gate and not st.session_state.get("lg_unlocked"):
+        st.caption("此面板包含 Amazon 账号凭据,需输入访问口令")
+        pw = st.text_input("访问口令", type="password", label_visibility="collapsed",
+                           placeholder="输入访问口令")
+        if st.button("解锁", type="primary", use_container_width=True):
+            if pw == gate:
+                st.session_state["lg_unlocked"] = True
+                st.rerun(scope="fragment")
+            else:
+                st.error("口令错误")
+        return
 
-    domain = st.selectbox("站点", sorted(set(DOMAINS) | set(ACCOUNTS.keys())), key="lg_domain")
+    st.caption("浏览器与登录态均在服务器端,登录一次长期有效")
+
+    # 站点选择:下拉选项内带登录状态(已登录 Xd / 未登录)
+    status = login_status()
+    acct_keys = {k for k in ACCOUNTS if not k.startswith("_")}  # 排除 _panel_password 等元键
+    all_domains = set(DOMAINS) | acct_keys
+    domains = [d for d in DOMAIN_ORDER if d in all_domains] + sorted(all_domains - set(DOMAIN_ORDER))
+    if "lg_domain" not in st.session_state:
+        st.session_state["lg_domain"] = "amazon.com" if "amazon.com" in domains else domains[0]
+    domain = st.session_state["lg_domain"]
+
+    options = []
+    for d in domains:
+        s = status.get(d)
+        if s and s["ok"]:
+            options.append(f"{DOMAIN_LABELS.get(d, d)} · 已登录({s['days']}d)")
+        else:
+            options.append(f"{DOMAIN_LABELS.get(d, d)} · 未登录")
+    sel = st.selectbox("站点", options, index=domains.index(domain),
+                       label_visibility="collapsed")
+    domain = domains[options.index(sel)]
+    st.session_state["lg_domain"] = domain
     acct = ACCOUNTS.get(domain, {})
-    a, p = acct.get("account", ""), acct.get("password", "")
 
-    col_a, col_b, col_c = st.columns(3)
-    account = col_a.text_input("小号账号", value=a, key="lg_account",
-                               placeholder="未配置 accounts.json 时手动填写")
-    password = col_b.text_input("小号密码", value=p, type="password", key="lg_password")
-    totp = col_c.text_input("TOTP 密钥(可选)", value=acct.get("totp_secret", ""),
-                            type="password", key="lg_totp",
-                            help="开两步验证时『无法扫描?』里的字母密钥;配了它 OTP 全自动")
+    # 当前站点登录状态提示
+    s = status.get(domain)
+    if s and s["ok"]:
+        st.success(f"{DOMAIN_LABELS.get(domain, domain)} 已登录({s['days']} 天前保存),通常无需重新登录")
+    else:
+        st.info(f"{DOMAIN_LABELS.get(domain, domain)} 尚未登录,填写下方凭据后开始登录")
 
-    c1, c2, c3 = st.columns(3)
-    code = st.text_input("验证码(仅未配 TOTP 且停在验证码页时)", key="lg_code")
+    # 账号信息(原生竖排输入)
+    account = st.text_input("Amazon 账号", value=acct.get("account", ""),
+                            key="lg_account")
+    password = st.text_input("账号密码", value=acct.get("password", ""),
+                             type="password", key="lg_password")
+    totp = st.text_input("TOTP 密钥(可选)", value=acct.get("totp_secret", ""),
+                         type="password", key="lg_totp",
+                         help="开两步验证时『无法扫描?』里的字母密钥;配了它 OTP 全自动")
+    code = st.text_input("验证码", key="lg_code",
+                         placeholder="仅未配 TOTP 且停在验证码页时需要")
 
+    c1, c2 = st.columns(2)
     try:
-        if c1.button("🚀 开始登录", type="primary", use_container_width=True):
+        if c1.button("开始登录", type="primary", use_container_width=True):
             if account and password:
-                weblogin.close_all()
+                weblogin.close_domains({domain})
                 msg, img = weblogin.get_session(domain).auto_login(
                     account, password, totp.strip())
                 st.session_state["lg_shot"] = img
                 st.session_state["lg_msg"] = msg
             else:
-                st.session_state["lg_msg"] = "先填小号账号/密码(或配置 accounts.json)"
+                st.session_state["lg_msg"] = "先填 Amazon 账号和密码"
         if c2.button("提交验证码", use_container_width=True):
             sess = weblogin.get_session(domain)
             if not code:
@@ -283,7 +430,7 @@ def login_dialog():
                 kind = "otp" if sess.page.query_selector(
                     "#auth-mfa-otpcode, input[name='otpCode']") is not None else "captcha"
                 st.session_state["lg_shot"] = sess.submit_code(kind, code)
-        if c3.button("刷新截图 / 检测登录态", use_container_width=True):
+        if st.button("检测登录态", use_container_width=True):
             sess = weblogin.get_session(domain)
             if sess.logged_in():
                 sess.finish()
@@ -304,42 +451,39 @@ def login_dialog():
     if st.session_state.get("lg_msg"):
         st.info(st.session_state["lg_msg"])
     if st.session_state.get("lg_shot"):
-        st.image(st.session_state["lg_shot"], caption=f"{domain} 登录页实时截图(服务器端浏览器)")
+        st.image(st.session_state["lg_shot"], caption=f"{domain} 登录页实时截图")
 
 
 # ---------- 顶栏 ----------
 
-st.markdown("### 🔍 AmReview · Amazon 评价链接批量检测")
-top_row = st.columns([0.6, 0.4])
-with top_row[0]:
-    st.caption("粘贴单条评价 permalink,逐条判定 ✅存活 / 🐕已删 / 🤖被拦 / 🍪登录失效 / ❓未知")
-with top_row[1]:
-    status = login_status()
-    online = sum(1 for v in status.values() if v["ok"])
-    row = st.columns([0.72, 0.28])
-    # 登录状态按钮动态显示：全部在线(绿)、部分在线(黄)、全部离线(灰)
-    btn_type = "primary" if online == len(status) else "secondary"
-    btn_label = f"🍪 小号登录 {online}/{len(status)}"
-    if row[0].button(btn_label, use_container_width=True, type=btn_type):
-        login_dialog()
-    if row[1].button("⚙️", use_container_width=True, help="系统维护:升级 Playwright 等"):
-        system_dialog()
+# ---------- 页面 ----------
+
+def page_reviews():
+    st.markdown("## 评价链接批量检测")
+    render_check_input()
+    render_results()
+
+
+def page_history():
+    st.markdown("## 检测历史")
+    render_history()
+
+
+def page_link_tracking():
+    st.markdown("## 页面链接跟踪")
+    st.info("规划中:跟踪产品/链接页面的快照与状态变化(价格、评分、评价数、上下架等),后端就绪后开放。")
 
 def render_check_input():
     """渲染检测输入区域"""
     with st.container(border=True):
-        # 为未来扩展预留：检测类型选择器
-        # check_type = st.radio(
-        #     "检测类型",
-        #     options=["评价链接", "产品链接(ASIN)"],
-        #     horizontal=True,
-        #     help="评价链接：判定存活状态并提取星级/标题/作者等\n产品链接：提取标题/价格/评分/Deal Tag/首图等"
-        # )
-
-        st.markdown("**📝 待检测链接**(每行一条,支持 /gp/customer-reviews/、/review/、portal 格式,六国混贴)")
-        text = st.text_area("链接", value=st.session_state.get("input_text", ""), height=140,
-                            label_visibility="collapsed",
+        st.markdown("**待检测链接**")
+        st.caption("每行一条,支持 /gp/customer-reviews/、/review/、portal 三种格式,六国站点可混贴")
+        # 手动写回 session_state:widget 状态在切页不渲染时会被框架清理,
+        # 手动保存的值才能跨页保留(切页往返输入不丢)
+        text = st.text_area("链接", value=st.session_state.get("input_text", ""),
+                            height=140, label_visibility="collapsed",
                             placeholder="https://www.amazon.com/gp/customer-reviews/R1XXXXXXX/\nhttps://www.amazon.in/review/R2XXXXXXX/")
+        st.session_state["input_text"] = text
         refs = parse_links(text)
         MAX_BATCH = 50  # 评审项:批量边界;限速 3~5s/条,50 条约 4 分钟,更多请分批防 IP 过热
         if len(refs) > MAX_BATCH:
@@ -351,12 +495,12 @@ def render_check_input():
             domain_labels = '、'.join(d.replace('amazon.','') for d in domains)
             btn_col1, btn_col2 = st.columns([0.75, 0.25])
             ok = btn_col1.button(
-                f"🚀 开始检测({len(refs)} 条 · {domain_labels})",
+                f"开始检测({len(refs)} 条 · {domain_labels})",
                 type="primary", use_container_width=True
             )
             btn_col2.write("")  # 占位
         else:
-            st.button("🚀 开始检测", type="primary", disabled=True, use_container_width=True)
+            st.button("开始检测", type="primary", disabled=True, use_container_width=True)
             ok = False
 
         if ok:
@@ -367,14 +511,14 @@ def render_results():
     """渲染检测结果区域"""
     results = st.session_state.get("results") or []
     if not results:
-        st.info("👆 粘贴链接后点击「开始检测」。浏览器与登录态在服务器端,历史自动留存可对比。")
+        st.info("粘贴链接后点击「开始检测」。浏览器与登录态在服务器端,历史自动留存可对比。")
         return
 
     prev = st.session_state.get("prev", {})
     expired = sorted({r["domain"] for r in results if r["status"] == "login_expired"})
     if expired:
-        st.warning("🍪 登录态缺失/失效:" + "、".join(d.replace("amazon.", "") for d in expired)
-                   + " → 点右上「小号登录」完成登录后重测")
+        st.warning("登录态缺失/失效:" + "、".join(d.replace("amazon.", "") for d in expired)
+                   + " → 点右上「Amazon 账号登录」完成登录后重测")
 
     # 统计卡片区域
     counts = {}
@@ -401,15 +545,11 @@ def render_results():
     ]
     for col, (key, label) in zip(cards, metric_order):
         count = counts.get(key, 0)
-        if len(results) > 0:
-            pct = f"{count / len(results) * 100:.0f}%"
-            col.metric(label, count, delta=pct if count > 0 else None)
-        else:
-            col.metric(label, count)
+        col.metric(label, count)
 
     # 多站点时显示分站统计
     if len(domain_stats) > 1:
-        with st.expander(f"📊 分站统计({len(domain_stats)} 个站点)", expanded=False):
+        with st.expander(f"分站统计({len(domain_stats)} 个站点)", expanded=False):
             stat_cols = st.columns(len(domain_stats))
             for col, (domain, stats) in zip(stat_cols, domain_stats.items()):
                 alive_rate = stats.get("alive", 0) / stats["total"] * 100 if stats["total"] > 0 else 0
@@ -439,9 +579,13 @@ def render_results():
         "上次": prev_col(r),
         "备注": r["note"] if r["note"] else "",
         "URL": r["url"],
+        "截图": Path(r["screenshot"]).name if r["screenshot"] else "",
     } for r in results]
 
-    st.dataframe(table, use_container_width=True, hide_index=True, height=min(35 + 35 * len(table), 420))
+    display_cols = ["状态", "站点", "星级", "标题", "作者", "日期", "VP", "上次", "备注"]
+    st.dataframe([{k: row[k] for k in display_cols} for row in table],
+                 use_container_width=True, hide_index=True,
+                 height=min(35 + 35 * len(table), 420))
 
     bottom = st.columns([0.25, 0.75])
     buf = io.StringIO()
@@ -450,12 +594,12 @@ def render_results():
     writer.writerows(table)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     filename = f"amreview_{timestamp}_{len(results)}条.csv"
-    bottom[0].download_button("⬇️ 导出 CSV", buf.getvalue().encode("utf-8-sig"),
+    bottom[0].download_button("导出 CSV", buf.getvalue().encode("utf-8-sig"),
                               file_name=filename, mime="text/csv", use_container_width=True)
 
     shots = [r for r in results if r["screenshot"] and Path(r["screenshot"]).exists()]
     if shots:
-        with bottom[1].expander(f"📸 截图证据({len(shots)} 张)"):
+        with bottom[1].expander(f"截图证据({len(shots)} 张)"):
             cols = st.columns(3)
             for i, r in enumerate(shots):
                 with cols[i % 3]:
@@ -464,9 +608,7 @@ def render_results():
 
 
 def render_history():
-    """渲染历史记录 Tab"""
-    st.markdown("### 📊 检测历史记录")
-
+    """渲染历史记录"""
     rows = recent_history(50)
     if not rows:
         st.info("暂无历史记录，完成第一次检测后会自动保存")
@@ -483,50 +625,15 @@ def render_history():
     st.dataframe(history_table, use_container_width=True, hide_index=True, height=500)
 
     stats = history_stats()
-    st.markdown("### 📈 历史统计")
+    st.markdown("### 历史统计")
     stat_cols = st.columns(len(stats) if stats else 1)
     for col, (status, count) in zip(stat_cols, stats):
         col.metric(STATUS_LABEL.get(status, status), count)
 
 
-def render_settings():
-    """渲染系统设置 Tab"""
-    st.markdown("### ⚙️ 系统设置")
-
-    # 登录状态管理
-    with st.container(border=True):
-        st.markdown("**🍪 登录状态管理**")
-        st.markdown(status_badges_html(login_status()), unsafe_allow_html=True)
-
-        if st.button("🍪 打开登录管理面板", use_container_width=True):
-            login_dialog()
-
-    # Playwright 版本信息
-    with st.container(border=True):
-        st.markdown("**🛠️ Playwright 版本**")
-        try:
-            cur = importlib.metadata.version("playwright")
-            st.code(f"当前版本: {cur}")
-        except Exception:
-            st.code("当前版本: 未知")
-
-        if st.button("⬆️ 升级 Playwright", use_container_width=True):
-            system_dialog()
-
-    # 数据库管理
-    with st.container(border=True):
-        st.markdown("**🗄️ 数据库管理**")
-        info = db_info()
-        if info:
-            size, count = info
-            st.caption(f"数据库大小: {size:.1f} KB · 记录数: {count} 条")
-        else:
-            st.caption("数据库尚未创建")
-
-
 def run_check(refs):
     """执行检测任务"""
-    weblogin.close_all()
+    weblogin.close_domains({r.domain for r in refs})
     prev = last_status_map(refs)
     progress = st.progress(0.0, text="启动浏览器…")
     results = []
@@ -552,32 +659,41 @@ def run_check(refs):
     st.rerun()
 
 
-# ---------- Tab 标签页主体 ----------
+# ---------- 侧边栏 ----------
 
-tab1, tab2, tab3 = st.tabs(["🚀 批量检测", "📊 历史记录", "⚙️ 系统设置"])
+with st.sidebar:
+    st.markdown("### AmReview")
+    st.caption("Amazon 评价链接批量检测")
+    st.divider()
 
-with tab1:
-    # 热度条
-    heat = heat_stats()
-    if heat:
-        pills = []
-        for domain, total, blocked in heat:
-            rate = (blocked or 0) / total
-            dot = "🟢" if rate < 0.05 else ("🟡" if rate < 0.2 else "🔴")
-            domain_short = domain.replace('amazon.', '')
-            pills.append(f"{dot} <code>{domain_short}</code> {rate:.0%} ({blocked or 0}/{total})")
-        with st.container(border=True):
-            st.markdown("**🌡️ IP 热度(近 24h)**　" + "　".join(pills), unsafe_allow_html=True)
-            st.caption("🟢 <5% 正常 · 🟡 5~20% 建议降频 · 🔴 >20% 暂停或换出口;登录通道 IP 必须保持 🟢")
+    status = login_status()
+    online = sum(1 for v in status.values() if v["ok"])
+    if st.button(f"Amazon 账号登录 ({online}/{len(status)})", use_container_width=True):
+        login_dialog()
+    if st.button("系统维护", use_container_width=True):
+        system_dialog()
+    st.divider()
 
-    # 检测输入区域移到这里
-    render_check_input()
+    # 页面切换:radio 在同一 session 内切换,输入与检测结果不丢失
+    # (st.navigation 会整页重载并重置 session_state,实测不可用)
+    page = st.radio("页面", ["评价链接检测", "检测历史", "页面链接跟踪"],
+                    label_visibility="collapsed", key="nav_page")
 
-    # 结果显示区域移到这里
-    render_results()
+    with st.expander("IP 热度（近 24h）", expanded=False):
+        heat = heat_stats()
+        if heat:
+            for domain, total, blocked in heat:
+                rate = (blocked or 0) / total
+                st.markdown(f"- {domain}: 拦截率 {rate:.0%}（{blocked or 0}/{total} 条）")
+            st.caption("拦截率 <5% 正常;5~20% 建议降频;>20% 暂停或更换出口 IP")
+        else:
+            st.caption("暂无检测数据")
 
-with tab2:
-    render_history()
+# ---------- 页面渲染 ----------
 
-with tab3:
-    render_settings()
+if page == "评价链接检测":
+    page_reviews()
+elif page == "检测历史":
+    page_history()
+else:
+    page_link_tracking()

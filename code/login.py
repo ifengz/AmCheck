@@ -1,11 +1,12 @@
 """一次性引导登录:python login.py [域名,默认 amazon.com]
 
-打开可见浏览器窗口 → 人工登录专用买家小号 → 检测到 at-main / x-main
+打开可见浏览器窗口 → 人工登录专用 Amazon 账号 → 检测到 at-main / x-main
 cookie 自动保存到 ~/.amreview/profile/<域名>/ → 关窗。之后 headless 静默跑。
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,11 +18,17 @@ PROFILE_ROOT = Path.home() / ".amreview" / "profile"
 TIMEOUT_SEC = 600  # 10 分钟内完成登录
 
 
+def _browser_args() -> list[str]:
+    """服务器常以 root 运行浏览器,不带 --no-sandbox 会被 Chromium/Chrome 拒绝启动。"""
+    return ["--no-sandbox"] if hasattr(os, "geteuid") and os.geteuid() == 0 else []
+
+
 def bootstrap_login(domain: str) -> bool:
     profile = PROFILE_ROOT / domain
     profile.mkdir(parents=True, exist_ok=True)
     pw = sync_playwright().start()
-    kwargs = dict(user_data_dir=str(profile), headless=False, locale="en-US")
+    kwargs = dict(user_data_dir=str(profile), headless=False, locale="en-US",
+                  args=_browser_args())
     try:
         ctx = pw.chromium.launch_persistent_context(channel="chrome", **kwargs)
     except Exception:
@@ -29,7 +36,7 @@ def bootstrap_login(domain: str) -> bool:
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     page.goto(f"https://www.{domain}/gp/sign-in.html")
 
-    print(f"请在打开的浏览器窗口中登录 {domain} 专用买家小号(验证码随意过)…")
+    print(f"请在打开的浏览器窗口中登录 {domain} 专用 Amazon 账号(验证码随意过)…")
     deadline = time.time() + TIMEOUT_SEC
     ok = False
     while time.time() < deadline:
