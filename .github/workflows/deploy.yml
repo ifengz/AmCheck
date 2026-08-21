@@ -1,0 +1,70 @@
+# 推送 main 后自动部署到宝塔服务器
+# 前置:在仓库 Settings → Secrets and variables → Actions 配置:
+#   SSH_HOST         服务器 IP
+#   SSH_USER         登录用户(宝塔一般 root)
+#   SSH_PORT         SSH 端口(默认 22)
+#   SSH_PRIVATE_KEY  服务器登录私钥(ed25519 完整内容)
+#   DEPLOY_PATH      服务器项目目录(宝塔 Python 项目管理器里的项目路径,末尾不带 /)
+# 示例:rsync 同步到 /www/wwwroot/amcheck/,该目录内直接是 app.py
+
+name: 部署到宝塔
+
+on:
+  push:
+    branches: [main]
+    paths: ['code/**', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rsync 同步 code/ 到服务器
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 排除运行时数据与敏感文件;exclude 的文件在 --delete 下也受保护,不会被删
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key -p $SSH_PORT -o StrictHostKeyChecking=no" \
+            --exclude '.venv' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
+            --exclude 'history.db' \
+            --exclude 'screenshots/' \
+            --exclude 'accounts.json' \
+            --exclude 'graphify-out' \
+            --exclude '.DS_Store' \
+            code/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
+
+      - name: 重启服务
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH }}
+            # 杀掉旧进程;宝塔 Python 管理器守护会自动拉起
+            # (若用 pm2 管理,把这行改为: pm2 restart amcheck)
+            pkill -f "streamlit run app.py" || true
+            sleep 2
+            # 确认端口监听(守护拉起需要几秒,最多等 20 秒)
+            for i in $(seq 1 10); do
+              if curl -s -o /dev/null --max-time 2 http://127.0.0.1:8765/; then
+                echo "✅ 服务已恢复 (端口 8765)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "⚠️ 端口 8765 未在 20 秒内恢复,请到宝塔面板检查项目状态" >&2
