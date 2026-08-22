@@ -1,9 +1,9 @@
 """AmReview Streamlit 主页:粘贴评价链接 → 批量检测 → 结果 + CSV。
 
-布局规范(公共组件,不手搓):
-- 顶栏:标题 + 站点登录状态灯 + 「Amazon 账号登录」按钮(弹窗 @st.dialog)
-- 热度条:近 24h 各站拦截率色点(🟢🟡🔴)
-- 卡片:st.container(border=True) + st.metric,统一留白
+布局规范(只用 Streamlit 公共组件,不手搓 HTML 组件):
+- 主体:一行工具条 + 一张全字段记录表(可排序/可点开验证),表外不铺内容
+- 验证:选中行 → 行内详情条(判定依据 + 原页面链接 + 截图弹窗 + 历史轨迹)
+- 辅助:分站统计、状态汇总、截图证据、演示数据、账号与维护 → 弹窗或侧边栏
 """
 
 from __future__ import annotations
@@ -34,6 +34,54 @@ DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
            "amazon.com.au", "amazon.co.jp"]
 
 st.set_page_config(page_title="AmReview 评价检测", page_icon="🔍", layout="wide")
+
+# SaaS 密度:只压间距,不改组件外观(组件一律用 Streamlit 原生)
+st.markdown("""<style>
+/* 顶距压到 1rem:原 2.4rem 在标题上方留了大片空白,空间让给表格 */
+.block-container {padding-top: 1rem; padding-bottom: .8rem; max-width: 1500px;}
+[data-testid="stSidebarUserContent"] {padding-top: 1rem;}
+[data-testid="stVerticalBlockBorderWrapper"] h1,
+[data-testid="stVerticalBlockBorderWrapper"] h2,
+[data-testid="stVerticalBlockBorderWrapper"] h3 {margin-top: 0;}
+h1, h2, h3 {letter-spacing: -.01em;}
+/* 共用标题条:固定行高,三页基线一致;替代 subheader 的 62px 高度 */
+.pg-title {font-size: 1.32rem; font-weight: 700; line-height: 1.9rem;
+           letter-spacing: -.01em; margin: 0;}
+.pg-meta {font-size: .78rem; line-height: 1.1rem; opacity: .6; margin: .1rem 0 0;}
+/* 表格上方的操作提示:与副行同字号同弱化,右对齐贴住它描述的那张表。
+   行高取 segmented_control 的 40px,并清掉 Streamlit 给 markdown 容器的
+   -16px 下边距 —— 否则该列量出来只有 24px,列的 center 对齐会低 8px。 */
+.pg-hint {font-size: .78rem; opacity: .6; margin: 0; text-align: right;
+          line-height: 40px;}
+[data-testid="stMarkdownContainer"]:has(.pg-hint) {margin-bottom: 0;}
+/* 标题条锁定 48px:无按钮的页面(如跟踪页)列高不会塌,三页基线严格对齐 */
+[data-testid="stHorizontalBlock"]:has(.pg-title) {min-height: 48px; gap: .5rem;}
+/* 文字类分区收紧,把纵向空间让给表格 */
+[data-testid="stCaptionContainer"] p {font-size: .78rem; line-height: 1.25;
+                                      margin-bottom: 0;}
+[data-testid="stAlert"] {padding: 0; margin: .35rem 0;}
+[data-testid="stAlert"] p {font-size: .82rem; line-height: 1.3; margin-bottom: 0;}
+/* 提示条真实高度来自内层容器(图标撑起 52px),压这里才有效 */
+[data-testid="stAlert"] .stAlertContainer {padding: .45rem .7rem; min-height: 0;}
+[data-testid="stAlert"] [data-testid="stMarkdownContainer"] {min-height: 0;}
+[data-testid="stElementContainer"]:has(> [data-testid="stMarkdownContainer"] .pg-title)
+    {margin-bottom: 0;}
+[data-testid="stMetricValue"] {font-size: 1.35rem;}
+[data-testid="stMetricLabel"] p {font-size: .78rem;}
+/* 分段控件原生 32px,按钮/popover 40px,同排会高低不齐 → 统一到 40 */
+[data-testid="stButtonGroup"] [data-baseweb="button-group"],
+[data-testid="stButtonGroup"] [data-baseweb="button-group"] button {height: 40px;}
+</style>""", unsafe_allow_html=True)
+
+# 状态元数据:表格文案 / 徽标配色 / 汇总顺序共用一份,避免各处硬编码分叉
+STATUS_META = {
+    "alive": ("正常", "green"),
+    "deleted": ("已删", "red"),
+    "blocked": ("被拦截", "orange"),
+    "login_expired": ("登录失效", "violet"),
+    "unknown": ("未知", "gray"),
+}
+STATUS_ORDER = ["alive", "deleted", "blocked", "login_expired", "unknown"]
 
 
 # ---------- 数据层 ----------
@@ -128,23 +176,44 @@ def login_status() -> dict[str, dict]:
     return out
 
 
-def recent_history(limit: int = 50):
-    """最近 N 条检测记录(历史 Tab 用)"""
+def recent_history(limit: int = 500, days: int | None = None):
+    """最近 N 条检测记录(历史回顾用);days=None 表示全部"""
     if not DB.exists():
         return []
+    where, params = "", []
+    if days:
+        where = "WHERE checked_at >= datetime('now', ?)"
+        params = [f"-{days} days"]
     with _db() as conn:
-        return conn.execute("""
-            SELECT review_id, domain, status, title, checked_at
-            FROM history ORDER BY checked_at DESC LIMIT ?""", (limit,)).fetchall()
+        return conn.execute(
+            f"""SELECT review_id, domain, status, title, checked_at
+                FROM history {where} ORDER BY checked_at DESC LIMIT ?""",
+            params + [limit]).fetchall()
 
 
-def history_stats():
-    """全量状态分布统计(历史 Tab 用)"""
+def history_stats(days: int | None = None):
+    """状态分布统计(历史回顾用,可按时间范围)"""
+    if not DB.exists():
+        return []
+    where, params = "", []
+    if days:
+        where = "WHERE checked_at >= datetime('now', ?)"
+        params = [f"-{days} days"]
+    with _db() as conn:
+        return conn.execute(
+            f"SELECT status, COUNT(*) FROM history {where} GROUP BY status",
+            params).fetchall()
+
+
+def review_history_timeline(review_id: str, limit: int = 20):
+    """单条链接的历史检测轨迹(倒序):结果页异常卡片展示"什么时候变狗的" """
     if not DB.exists():
         return []
     with _db() as conn:
         return conn.execute(
-            "SELECT status, COUNT(*) FROM history GROUP BY status").fetchall()
+            """SELECT status, stars, title, checked_at FROM history
+               WHERE review_id = ? ORDER BY checked_at DESC LIMIT ?""",
+            (review_id, limit)).fetchall()
 
 
 def db_info():
@@ -154,6 +223,200 @@ def db_info():
     with _db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
     return DB.stat().st_size / 1024, count
+
+
+# ---------- 演示数据(仅用于预览界面效果,不参与真实检测流程) ----------
+
+# 结果视图示例:覆盖全部 5 种状态、6 个站点,含上次对比、异常详情、分站统计与截图证据
+MOCK_RESULTS = [
+    {
+        "review_id": "R1ALIVE1234", "domain": "amazon.com", "status": "alive",
+        "stars": "4", "title": "Great product, works as expected",
+        "author": "John D.", "review_date": "2026年8月10日", "body": "Worth every penny.",
+        "verified": True, "note": "", "shot_kind": "", "checked_at": "2026-08-22 03:00:05",
+        "url": "https://www.amazon.com/gp/customer-reviews/R1ALIVE1234/",
+        "prev_status": None, "prev_time": "",
+    },
+    {
+        "review_id": "R2DELETED6789", "domain": "amazon.in", "status": "deleted",
+        "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+        "verified": False, "note": "正常·08-1 HTTP 404 · Page Not Found",
+        "shot_kind": "deleted", "checked_at": "2026-08-22 03:00:00",
+        "url": "https://www.amazon.in/gp/customer-reviews/R2DELETED6789/",
+        "prev_status": "✅ 正常", "prev_time": "2026-08-22 02:00:30",
+    },
+    {
+        "review_id": "R3BLOCKED1111", "domain": "amazon.com.au", "status": "blocked",
+        "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+        "verified": False, "note": "重试 3 次仍被拦截(guard/captcha 拦截),建议稍后复测",
+        "shot_kind": "", "checked_at": "2026-08-22 02:30:00",
+        "url": "https://www.amazon.com.au/gp/customer-reviews/R3BLOCKED1111/",
+        "prev_status": None, "prev_time": "",
+    },
+    {
+        "review_id": "R4LOGIN2222", "domain": "amazon.co.jp", "status": "login_expired",
+        "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+        "verified": False, "note": "跳转登录页,需重新引导登录该站点 Amazon 账号",
+        "shot_kind": "", "checked_at": "2026-08-22 02:01:00",
+        "url": "https://www.amazon.co.jp/gp/customer-reviews/R4LOGIN2222/",
+        "prev_status": None, "prev_time": "",
+    },
+    {
+        "review_id": "R5UNKNOWN3333", "domain": "amazon.com.mx", "status": "unknown",
+        "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+        "verified": False, "note": "已删·08-1 HTTP 200 · 无法识别的页面形态",
+        "shot_kind": "unknown", "checked_at": "2026-08-22 02:00:30",
+        "url": "https://www.amazon.com.mx/gp/customer-reviews/R5UNKNOWN3333/",
+        "prev_status": "🐕 已删", "prev_time": "2026-08-22 01:30:00",
+    },
+    {
+        "review_id": "R6ALIVE4444", "domain": "amazon.com.br", "status": "alive",
+        "stars": "5", "title": "Excelente produto!", "author": "Maria S.",
+        "review_date": "2026年8月5日", "body": "Recomendo.", "verified": False,
+        "note": "", "shot_kind": "", "checked_at": "2026-08-22 01:30:30",
+        "url": "https://www.amazon.com.br/gp/customer-reviews/R6ALIVE4444/",
+        "prev_status": None, "prev_time": "",
+    },
+]
+
+
+def _mock_font(size: int):
+    """跨平台找一个可用的 TrueType 字体,找不到再退回默认字体。"""
+    from PIL import ImageFont
+    for p in ("/System/Library/Fonts/Helvetica.ttc",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _make_mock_shot(review_id: str, kind: str) -> str:
+    """为演示结果生成一张占位截图(已删/未知页样式),落盘到 screenshots/
+    同名目录、固定文件名,多次点击复用不堆积。"""
+    shot_dir = Path(__file__).parent / "screenshots"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    path = shot_dir / f"{review_id}_mock.png"
+    if path.exists():
+        return str(path)
+    try:
+        from PIL import Image, ImageDraw
+        W, H = 900, 400
+        img = Image.new("RGB", (W, H), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        # 顶部工具栏
+        d.rectangle([0, 0, W, 70], fill=(35, 47, 62))
+        d.rectangle([0, 0, 150, 70], fill=(68, 71, 85))
+        d.rectangle([160, 20, 300, 50], fill=(255, 255, 255))
+        d.rectangle([330, 20, 430, 50], fill=(255, 255, 255))
+        # 主体:蓝色横幅 + 文案(贴 Amazon SORRY 页风格)
+        d.rectangle([120, 130, 780, 330], outline=(221, 221, 221), width=2)
+        d.rectangle([120, 130, 780, 210], fill=(160, 174, 192))
+        d.text((150, 158), "Sorry", fill=(255, 255, 255), font=_mock_font(36))
+        d.text((150, 240), "we couldn't find that page",
+               fill=(17, 94, 89), font=_mock_font(28))
+        d.text((150, 285), f"演示截图 · {review_id}", fill=(102, 102, 102),
+               font=_mock_font(16))
+        img.save(path)
+    except Exception:
+        pass
+    return str(path)
+
+
+def load_mock_results():
+    """载入演示结果:覆盖全状态/全站点,写入本轮结果与对比数据并展示。"""
+    results = []
+    for src in MOCK_RESULTS:
+        r = dict(src)
+        r["screenshot"] = _make_mock_shot(r["review_id"], r["shot_kind"]) \
+            if r["shot_kind"] else ""
+        r.pop("shot_kind", None)
+        r.pop("prev_status", None)
+        r.pop("prev_time", None)
+        results.append(r)
+    st.session_state["results"] = results
+    st.session_state["prev"] = {
+        m["review_id"]: (m["prev_status"], m["prev_time"])
+        for m in MOCK_RESULTS if m["prev_status"]
+    }
+    save_history(results)
+    st.rerun()
+
+
+# 历史视图示例:68 条记录(固定18条 + 追加50条),用于检查长表格展示
+# 元组:(review_id, domain, status, stars, title, author, check_time)
+MOCK_HISTORY = [
+    ("R1ALIVEDDDD", "amazon.com.au", "alive", "5", "Excellent quality, fast shipping", "Tom H.", "2026-08-22 03:00:30"),
+    ("R1LOGINCCCC", "amazon.com", "login_expired", "", "", "", "2026-08-22 03:00:00"),
+    ("R1ALIVEBBBB", "amazon.com.mx", "alive", "5", "Muy buen producto, lo recomiendo", "Laura G.", "2026-08-22 02:30:30"),
+    ("R1BLOCKEDAAAA", "amazon.com", "blocked", "", "", "", "2026-08-22 02:30:00"),
+    ("R1UNKNOWN9999", "amazon.co.jp", "unknown", "", "", "", "2026-08-22 02:01:00"),
+    ("R1ALIVE8888", "amazon.in", "alive", "4", "बहुत अच्छा उत्पाद, धन्यवाद", "Priya S.", "2026-08-22 02:00:30"),
+    ("R9BLOCKED7777", "amazon.com.au", "blocked", "", "", "", "2026-08-22 02:00:00"),
+    ("R8DELETED6666", "amazon.com", "deleted", "", "", "", "2026-08-22 01:30:30"),
+    ("R7ALIVE5555", "amazon.com", "alive", "5", "Perfect, arrived on time", "Alex K.", "2026-08-22 01:30:00"),
+    ("R1ALIVE1234", "amazon.com", "alive", "4", "Great product, works as expected", "John D.", "2026-08-22 01:00:05"),
+    ("R2DELETED6789", "amazon.in", "deleted", "", "", "", "2026-08-22 01:00:00"),
+    ("R5ALIVE9999", "amazon.com.br", "alive", "5", "Produto excelente!", "Maria S.", "2026-08-21 20:30:00"),
+    ("R6ALIVE1212", "amazon.in", "alive", "4", "Good value for money", "Rohan V.", "2026-08-21 19:00:00"),
+    ("R7ALIVE3434", "amazon.co.jp", "alive", "5", "期待通りの商品でした", "佐藤", "2026-08-21 18:00:00"),
+    ("R4LOGIN2222", "amazon.co.jp", "login_expired", "", "", "", "2026-08-21 15:40:00"),
+    ("R9ALIVE7878", "amazon.com.au", "alive", "4", "Average quality, could be better", "Sam T.", "2026-08-20 10:05:00"),
+    ("R8ALIVE5656", "amazon.com", "alive", "5", "Fast delivery, happy", "Lily W.", "2026-08-20 09:00:00"),
+    ("R5UNKNOWN3333", "amazon.com.mx", "unknown", "", "", "", "2026-08-20 08:00:00"),
+]
+
+
+def _make_mock_history_rows(count: int = 50):
+    """生成固定的长列表演示数据,不使用随机值,便于重复预览。"""
+    statuses = ("alive", "alive", "deleted", "blocked", "login_expired", "unknown")
+    domains = tuple(DOMAINS)
+    titles = {
+        "alive": ("Reliable product, would buy again", "Good quality and quick delivery"),
+        "deleted": ("Review no longer available", "Page removed by the reviewer"),
+        "blocked": ("", ""),
+        "login_expired": ("", ""),
+        "unknown": ("", ""),
+    }
+    rows = []
+    for i in range(1, count + 1):
+        status = statuses[(i - 1) % len(statuses)]
+        title = titles[status][(i - 1) % len(titles[status])]
+        alive = status == "alive"
+        rows.append((
+            f"RMOCK{i:04d}",
+            domains[(i - 1) % len(domains)],
+            status,
+            str(3 + i % 3) if alive else "",
+            title,
+            f"Demo User {i:02d}" if alive else "",
+            f"2026-08-{22 - (i - 1) // 10:02d} {((i - 1) % 10) * 2:02d}:15:00",
+        ))
+    return rows
+
+
+MOCK_HISTORY.extend(_make_mock_history_rows())
+
+
+def load_mock_history():
+    """载入演示历史:先清理本批演示记录再写入,保证幂等且不误伤真实数据。"""
+    ids = [h[0] for h in MOCK_HISTORY]
+    with _db() as conn:
+        conn.executemany("DELETE FROM history WHERE review_id = ?",
+                         [(i,) for i in ids])
+        conn.executemany(
+            """INSERT INTO history (review_id, domain, url, status, stars, title,
+               author, review_date, note, checked_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?)""",
+            [(rid, domain, f"https://www.{domain}/gp/customer-reviews/{rid}/",
+              status, stars, title, author, check_time)
+             for rid, domain, status, stars, title, author, check_time in MOCK_HISTORY],
+        )
 
 
 init_db()
@@ -458,178 +721,364 @@ def login_dialog():
 
 # ---------- 页面 ----------
 
+def page_header(title: str, meta: str = ""):
+    """所有页面共用的标题条:左标题+副行,右侧留给操作区。
+
+    三页走同一函数,标题基线与内容起点才会一致,切换页面不会错位。
+    返回右侧列,调用方把按钮放进去即可。
+
+    左列固定宽:标题+副行实测最宽 258px,给 300px 即可不换行;
+    余量全留给右侧工具条(历史页 3 个控件需 469px,50/50 分栏会挤到第二行,
+    把标题行从 48px 顶到 96px,切页就是肉眼可见的错位)。
+    """
+    left, right = st.columns([300, 560], vertical_alignment="center")
+    with left:
+        st.markdown(f'<div class="pg-title">{title}</div>', unsafe_allow_html=True)
+        if meta:
+            st.markdown(f'<div class="pg-meta">{meta}</div>', unsafe_allow_html=True)
+    return right
+
+
 def page_reviews():
-    st.markdown("## 评价链接批量检测")
-    render_check_input()
-    render_results()
+    """一屏一件事:无结果→紧凑输入卡,有结果→工具条 + 记录表"""
+    if st.session_state.get("results"):
+        render_results()
+    else:
+        render_check_input()
 
 
 def page_history():
-    st.markdown("## 检测历史")
     render_history()
 
 
 def page_link_tracking():
-    st.markdown("## 页面链接跟踪")
-    st.info("规划中:跟踪产品/链接页面的快照与状态变化(价格、评分、评价数、上下架等),后端就绪后开放。")
+    page_header("页面链接跟踪", "规划中 · 后端就绪后开放")
+    st.info("跟踪产品/链接页面的快照与状态变化(价格、评分、评价数、上下架等)。",
+            icon=":material/construction:")
+
+
+MAX_BATCH = 50  # 批量边界:限速 3~5s/条,50 条约 4 分钟,更多请分批防 IP 过热
+
 
 def render_check_input():
-    """渲染检测输入区域"""
+    """紧凑输入卡:标题条 + 粘贴框 + 解析摘要 + 主按钮,辅助入口收在右侧"""
+    right = page_header("评价链接批量检测", "粘贴链接 · 每条 3~5 秒 · 支持六国站点混贴")
+    with right:
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            with st.popover("演示数据", icon=":material/science:"):
+                st.caption("填充覆盖全部状态/站点的示例数据,仅预览界面,不联网、不影响真实检测")
+                if st.button("载入 6 条演示结果", use_container_width=True):
+                    load_mock_results()
+
     with st.container(border=True):
-        st.markdown("**待检测链接**")
-        st.caption("每行一条,支持 /gp/customer-reviews/、/review/、portal 三种格式,六国站点可混贴")
         # 手动写回 session_state:widget 状态在切页不渲染时会被框架清理,
         # 手动保存的值才能跨页保留(切页往返输入不丢)
-        text = st.text_area("链接", value=st.session_state.get("input_text", ""),
-                            height=140, label_visibility="collapsed",
-                            placeholder="https://www.amazon.com/gp/customer-reviews/R1XXXXXXX/\nhttps://www.amazon.in/review/R2XXXXXXX/")
+        text = st.text_area(
+            "链接", value=st.session_state.get("input_text", ""), height=150,
+            label_visibility="collapsed",
+            placeholder="每行一条,六国站点可混贴\n"
+                        "https://www.amazon.com/gp/customer-reviews/R1XXXXXXX/\n"
+                        "https://www.amazon.in/review/R2XXXXXXX/")
         st.session_state["input_text"] = text
         refs = parse_links(text)
-        MAX_BATCH = 50  # 评审项:批量边界;限速 3~5s/条,50 条约 4 分钟,更多请分批防 IP 过热
         if len(refs) > MAX_BATCH:
-            st.warning(f"一次最多检测 {MAX_BATCH} 条(每条 3~5 秒,更多会把 IP 跑热);"
+            st.warning(f"一次最多 {MAX_BATCH} 条(每条 3~5 秒,更多会把 IP 跑热);"
                        f"已截取前 {MAX_BATCH} 条,其余请分批。")
             refs = refs[:MAX_BATCH]
-        if refs:
-            domains = sorted({r.domain for r in refs})
-            domain_labels = '、'.join(d.replace('amazon.','') for d in domains)
-            btn_col1, btn_col2 = st.columns([0.75, 0.25])
-            ok = btn_col1.button(
-                f"开始检测({len(refs)} 条 · {domain_labels})",
-                type="primary", use_container_width=True
-            )
-            btn_col2.write("")  # 占位
-        else:
-            st.button("开始检测", type="primary", disabled=True, use_container_width=True)
-            ok = False
 
-        if ok:
-            run_check(refs)
+        bar = st.columns([0.62, 0.38], vertical_alignment="center")
+        with bar[0]:
+            if refs:
+                doms = sorted({r.domain for r in refs})
+                with st.container(horizontal=True):
+                    st.badge(f"{len(refs)} 条链接", color="blue",
+                             icon=":material/link:")
+                    for d in doms:
+                        st.badge(d.replace("amazon.", ""), color="gray")
+            else:
+                st.caption("支持 /gp/customer-reviews/、/review/、portal 三种格式")
+        ok = bar[1].button("开始检测", type="primary", icon=":material/play_arrow:",
+                           disabled=not refs, use_container_width=True)
+
+    if ok:
+        run_check(refs)
+
+
+@st.dialog("证据查看", width="large")
+def shot_dialog(r):
+    """抽查校验:大图 + 判定依据 + 原页面链接 + 历史轨迹"""
+    label, color = STATUS_META.get(r["status"], (r["status"], "gray"))
+    with st.container(horizontal=True):
+        st.badge(label, color=color)
+        st.badge(r["review_id"], color="gray")
+        st.badge(r["domain"].replace("amazon.", ""), color="gray")
+    if r["note"]:
+        st.caption(f"判定依据:{r['note']}")
+    # 抓到的原文摘要:表格列放不下,放弹窗做人工核对的第一手依据
+    if r.get("body"):
+        meta = " · ".join(x for x in (
+            f"{r['stars']} ★" if str(r["stars"]).isdigit() else "",
+            r["author"], r["review_date"],
+            "Verified Purchase" if r["verified"] else "") if x)
+        if meta:
+            st.caption(meta)
+        if r["title"]:
+            st.markdown(f"**{r['title']}**")
+        st.text(r["body"])
+    st.link_button("打开原页面", r["url"], icon=":material/open_in_new:")
+    if r.get("screenshot") and Path(r["screenshot"]).exists():
+        st.image(r["screenshot"], use_container_width=True,
+                 caption=f"检测时页面快照 · {r['checked_at']}")
+    else:
+        st.caption("本条无截图(仅正常状态或截图失败时出现)")
+    tl = review_history_timeline(r["review_id"])
+    if len(tl) > 1:
+        st.dataframe(
+            [{"检测时间": t[3], "状态": STATUS_LABEL.get(t[0], t[0]),
+              "星级": f"{t[1]} ★" if str(t[1]).isdigit() else "—",
+              "标题": t[2] or "—"} for t in tl],
+            hide_index=True, use_container_width=True, height=200)
+
+
+@st.dialog("分站统计", width="medium")
+def domain_stats_dialog(results):
+    """分站维度的量与存活率:用 dataframe + ProgressColumn,不手搓进度条"""
+    agg = {}
+    for r in results:
+        d = r["domain"].replace("amazon.", "")
+        a = agg.setdefault(d, {"total": 0, "alive": 0})
+        a["total"] += 1
+        a["alive"] += r["status"] == "alive"
+    st.dataframe(
+        [{"站点": d, "条数": a["total"], "存活": a["alive"],
+          "存活率": a["alive"] / a["total"]}
+         for d, a in sorted(agg.items(), key=lambda kv: -kv[1]["total"])],
+        hide_index=True, use_container_width=True,
+        column_config={
+            "存活率": st.column_config.ProgressColumn(
+                format="percent", min_value=0, max_value=1),
+        })
+
+
+@st.dialog("截图证据", width="large")
+def evidence_dialog(shots):
+    """本轮全部截图集中查看,不铺在主页面"""
+    st.caption(f"共 {len(shots)} 张 · 点开原页面可二次核验")
+    for r in shots:
+        label, color = STATUS_META.get(r["status"], (r["status"], "gray"))
+        with st.container(border=True):
+            with st.container(horizontal=True):
+                st.badge(label, color=color)
+                st.badge(r["review_id"], color="gray")
+                st.link_button("原页面", r["url"], icon=":material/open_in_new:")
+            st.image(r["screenshot"], use_container_width=True)
+
+
+def _results_csv(results, prev) -> bytes:
+    """导出全字段 CSV(含 URL 与截图文件名,便于线下核验)"""
+    rows = [{
+        "状态": STATUS_META.get(r["status"], (r["status"], ""))[0],
+        "Review ID": r["review_id"],
+        "站点": r["domain"].replace("amazon.", ""),
+        "星级": r["stars"] or "",
+        "标题": r["title"] or "",
+        "作者": r["author"] or "",
+        "评价日期": r["review_date"] or "",
+        "VP": "是" if r["verified"] else "",
+        "正文": r.get("body") or "",
+        "上次状态": (prev.get(r["review_id"]) or ("", ""))[0],
+        "上次时间": (prev.get(r["review_id"]) or ("", ""))[1],
+        "判定依据": r["note"] or "",
+        "检测时间": r["checked_at"],
+        "URL": r["url"],
+        "截图": Path(r["screenshot"]).name if r.get("screenshot") else "",
+    } for r in results]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8-sig")
 
 
 def render_results():
-    """渲染检测结果区域"""
+    """结果视图:工具条 + 全字段记录表;验证细节走行选中与弹窗,不铺主页面。"""
     results = st.session_state.get("results") or []
-    if not results:
-        st.info("粘贴链接后点击「开始检测」。浏览器与登录态在服务器端,历史自动留存可对比。")
-        return
-
     prev = st.session_state.get("prev", {})
-    expired = sorted({r["domain"] for r in results if r["status"] == "login_expired"})
-    if expired:
-        st.warning("登录态缺失/失效:" + "、".join(d.replace("amazon.", "") for d in expired)
-                   + " → 点右上「Amazon 账号登录」完成登录后重测")
-
-    # 统计卡片区域
     counts = {}
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
 
-    # 新增：按域名分组统计
-    domain_stats = {}
-    for r in results:
-        d = r["domain"].replace("amazon.", "")
-        if d not in domain_stats:
-            domain_stats[d] = {"total": 0, "alive": 0, "deleted": 0, "blocked": 0}
-        domain_stats[d]["total"] += 1
-        if r["status"] in domain_stats[d]:
-            domain_stats[d][r["status"]] += 1
+    # ── 工具条:标题 / 状态筛选 / 统计与导出入口 / 新一轮 ──
+    # 副行只放本轮事实(条数+时间);"点选行看依据"是操作提示,
+    # 放这里会把副行挤成两行、标题基线从 39px 抬到 32px,与其余三页错位,
+    # 故移到筛选行右侧——紧贴它描述的那张表。
+    right = page_header("评价链接批量检测",
+                        f"本轮 {len(results)} 条 · {results[0]['checked_at']}")
+    with right:
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            st.download_button(
+                "导出 CSV", _results_csv(results, prev),
+                file_name=f"amreview_{datetime.now():%Y%m%d_%H%M}_{len(results)}条.csv",
+                mime="text/csv", icon=":material/download:")
+            if st.button("分站统计", icon=":material/bar_chart:"):
+                domain_stats_dialog(results)
+            shots = [r for r in results
+                     if r.get("screenshot") and Path(r["screenshot"]).exists()]
+            if shots and st.button(f"截图 {len(shots)}", icon=":material/image:"):
+                evidence_dialog(shots)
+            if st.button("新一轮", type="primary", icon=":material/refresh:"):
+                st.session_state.update(results=[], prev={})
+                st.rerun()
 
-    cards = st.columns(5)
-    metric_order = [
-        ("alive", "✅ 正常"),
-        ("deleted", "🐕 已删"),
-        ("blocked", "🤖 被拦截"),
-        ("login_expired", "🍪 登录失效"),
-        ("unknown", "❓ 未知"),
-    ]
-    for col, (key, label) in zip(cards, metric_order):
-        count = counts.get(key, 0)
-        col.metric(label, count)
+    expired = sorted({r["domain"] for r in results if r["status"] == "login_expired"})
+    if expired:
+        st.warning("登录失效:"
+                   + "、".join(d.replace("amazon.", "") for d in expired)
+                   + " → 侧边栏「账号登录」后重测", icon=":material/cookie:")
 
-    # 多站点时显示分站统计
-    if len(domain_stats) > 1:
-        with st.expander(f"分站统计({len(domain_stats)} 个站点)", expanded=False):
-            stat_cols = st.columns(len(domain_stats))
-            for col, (domain, stats) in zip(stat_cols, domain_stats.items()):
-                alive_rate = stats.get("alive", 0) / stats["total"] * 100 if stats["total"] > 0 else 0
-                col.metric(
-                    f"{domain}",
-                    f"{stats['total']} 条",
-                    delta=f"存活率 {alive_rate:.0f}%"
-                )
+    # 状态筛选:只列出本轮出现过的状态,标签带条数
+    label_to_status = {f"{STATUS_META[s][0]} {counts[s]}": s
+                       for s in STATUS_ORDER if counts.get(s)}
+    fl, fr = st.columns([0.7, 0.3], vertical_alignment="center")
+    with fl:
+        sel = st.segmented_control("状态筛选", ["全部"] + list(label_to_status),
+                                   default="全部", key="res_filter",
+                                   label_visibility="collapsed")
+    with fr:
+        st.markdown('<div class="pg-hint">点选表格行查看判定依据与截图</div>',
+                    unsafe_allow_html=True)
+    keep = label_to_status.get(sel)
+    shown = [r for r in results if keep is None or r["status"] == keep]
 
-    def prev_col(r):
+    # ── 全字段记录表(主体):信息齐全 + 原页面直达,可排序可选中 ──
+    def prev_cell(r) -> str:
         p = prev.get(r["review_id"])
         if not p:
             return "—"
-        mark = "" if p[0] == STATUS_LABEL[r["status"]] else " ⚠️"
-        return f"{p[0]} · {p[1][5:16]}{mark}"
+        changed = p[0] != STATUS_LABEL[r["status"]]
+        return f"{'⚠ ' if changed else ''}{p[0].split(' ')[-1]} · {p[1][5:16]}"
 
-    # 表格数据
     table = [{
-        "状态": STATUS_LABEL[r["status"]],
+        "状态": STATUS_LABEL.get(r["status"], r["status"]),
         "Review ID": r["review_id"],
         "站点": r["domain"].replace("amazon.", ""),
-        "星级": r["stars"] if r["stars"] else "—",
-        "标题": r["title"] if r["title"] else "—",
-        "作者": r["author"] if r["author"] else "—",
-        "日期": r["review_date"] if r["review_date"] else "—",
-        "VP": "✓" if r["verified"] else "",
-        "上次": prev_col(r),
-        "备注": r["note"] if r["note"] else "",
-        "URL": r["url"],
-        "截图": Path(r["screenshot"]).name if r["screenshot"] else "",
-    } for r in results]
+        # 文本列而非数字列:星级只有 1~5 单字符,排序结果一致,空值不会渲染成 None
+        "星级": f"{r['stars']} ★" if str(r["stars"]).isdigit() else "—",
+        "VP": bool(r["verified"]),
+        "标题": r["title"] or "—",
+        "作者": r["author"] or "—",
+        "评价日期": r["review_date"] or "—",
+        "上次": prev_cell(r),
+        "判定依据": r["note"] or "—",
+        "检测时间": r["checked_at"][5:16],
+        "原页面": r["url"],
+    } for r in shown]
 
-    display_cols = ["状态", "站点", "星级", "标题", "作者", "日期", "VP", "上次", "备注"]
-    st.dataframe([{k: row[k] for k in display_cols} for row in table],
-                 use_container_width=True, hide_index=True,
-                 height=min(35 + 35 * len(table), 420))
+    picked = st.dataframe(
+        table, use_container_width=True, hide_index=True, row_height=34,
+        # 行少时按内容收紧,行多时给大屏一个高值填满视口(dataframe 不支持 stretch)
+        height=min(1000, 44 + 34 * len(table)),
+        key="res_table", on_select="rerun", selection_mode="single-row",
+        column_config={
+            # 12 列要在一屏内不横向截断:仅标题给 medium,其余压到 small
+            # emoji + 4 字(登录失效)在 small 下会截断 → medium
+            "状态": st.column_config.TextColumn(width="medium", pinned=True),
+            # 主键要能整串核对,不能截断 → medium(已 pinned,横滚时仍可见)
+            "Review ID": st.column_config.TextColumn(width="medium", pinned=True),
+            "站点": st.column_config.TextColumn(width="small"),
+            "星级": st.column_config.TextColumn(width="small"),
+            "VP": st.column_config.CheckboxColumn(
+                width="small", help="Verified Purchase 已验证购买"),
+            "标题": st.column_config.TextColumn(width="medium"),
+            "作者": st.column_config.TextColumn(width="small"),
+            "评价日期": st.column_config.TextColumn(width="small"),
+            "上次": st.column_config.TextColumn(
+                width="small", help="上一轮该 ID 的状态与时间,⚠ 表示本轮有变化"),
+            "判定依据": st.column_config.TextColumn(
+                width="small", help="状态判定的原始依据,点行看完整内容"),
+            "检测时间": st.column_config.TextColumn(width="small"),
+            "原页面": st.column_config.LinkColumn(
+                width="small", display_text="打开", help="在 Amazon 打开原页面复核"),
+        })
 
-    bottom = st.columns([0.25, 0.75])
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=list(table[0].keys()))
-    writer.writeheader()
-    writer.writerows(table)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"amreview_{timestamp}_{len(results)}条.csv"
-    bottom[0].download_button("导出 CSV", buf.getvalue().encode("utf-8-sig"),
-                              file_name=filename, mime="text/csv", use_container_width=True)
+    # ── 选中行 → 行内验证条(判定依据 / 原页面 / 证据弹窗) ──
+    rows = picked.selection.rows if hasattr(picked, "selection") else []
+    if rows:
+        r = shown[rows[0]]
+        label, color = STATUS_META.get(r["status"], (r["status"], "gray"))
+        with st.container(border=True):
+            bar = st.columns([0.72, 0.28], vertical_alignment="center")
+            with bar[0]:
+                with st.container(horizontal=True):
+                    st.badge(label, color=color)
+                    st.badge(r["review_id"], color="gray")
+                    st.badge(r["domain"].replace("amazon.", ""), color="gray")
+                st.caption(r["note"] or (r["title"] or "无附加判定说明"))
+            with bar[1]:
+                with st.container(horizontal=True, horizontal_alignment="right"):
+                    st.link_button("原页面", r["url"],
+                                   icon=":material/open_in_new:")
+                    if st.button("证据", type="primary", icon=":material/fact_check:",
+                                 key=f"ev_{r['review_id']}"):
+                        shot_dialog(r)
 
-    shots = [r for r in results if r["screenshot"] and Path(r["screenshot"]).exists()]
-    if shots:
-        with bottom[1].expander(f"截图证据({len(shots)} 张)"):
-            cols = st.columns(3)
-            for i, r in enumerate(shots):
-                with cols[i % 3]:
-                    st.markdown(f"**{r['review_id']}** {STATUS_LABEL[r['status']]}")
-                    st.image(r["screenshot"])
+
+@st.dialog("历史状态统计", width="medium")
+def history_stats_dialog(days):
+    stats = history_stats(days)
+    total = sum(c for _, c in stats) or 1
+    st.dataframe(
+        [{"状态": STATUS_LABEL.get(s, s), "条数": c, "占比": c / total}
+         for s, c in sorted(stats, key=lambda kv: -kv[1])],
+        hide_index=True, use_container_width=True,
+        column_config={"占比": st.column_config.ProgressColumn(
+            format="percent", min_value=0, max_value=1)})
 
 
 def render_history():
-    """渲染历史记录"""
-    rows = recent_history(50)
+    """历史回顾:工具条 + 明细表;统计与演示数据收进弹窗。"""
+    days_map = {"近 7 天": 7, "近 30 天": 30, "全部": None}
+
+    right = page_header("检测历史", "每次检测自动留存,可按站点/状态排序核对变化")
+    with right:
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            sel = st.segmented_control("时间范围", list(days_map), default="近 7 天",
+                                       key="hist_range", label_visibility="collapsed")
+            days = days_map.get(sel, 7)
+            if st.button("统计", icon=":material/bar_chart:"):
+                history_stats_dialog(days)
+            with st.popover("演示数据", icon=":material/science:"):
+                st.caption("追加 68 条固定演示记录,用于预览长列表效果")
+                if st.button("载入演示历史", use_container_width=True):
+                    load_mock_history()
+                    st.rerun()
+
+    rows = recent_history(500, days)
     if not rows:
-        st.info("暂无历史记录，完成第一次检测后会自动保存")
+        st.info("暂无历史记录,完成第一次检测后会自动保存",
+                icon=":material/history:")
         return
 
-    history_table = [{
-        "检测时间": r[4],
-        "Review ID": r[0],
-        "站点": r[1].replace("amazon.", ""),
-        "状态": STATUS_LABEL.get(r[2], r[2]),
-        "标题": r[3][:40] + "..." if r[3] and len(r[3]) > 40 else (r[3] or "—"),
-    } for r in rows]
-
-    st.dataframe(history_table, use_container_width=True, hide_index=True, height=500)
-
-    stats = history_stats()
-    st.markdown("### 历史统计")
-    stat_cols = st.columns(len(stats) if stats else 1)
-    for col, (status, count) in zip(stat_cols, stats):
-        col.metric(STATUS_LABEL.get(status, status), count)
-
+    st.dataframe(
+        [{"检测时间": r[4], "Review ID": r[0],
+          "站点": r[1].replace("amazon.", ""),
+          "状态": STATUS_LABEL.get(r[2], r[2]),
+          "标题": r[3] or "—",
+          "原页面": f"https://www.{r[1]}/gp/customer-reviews/{r[0]}/"}
+         for r in rows],
+        use_container_width=True, hide_index=True, row_height=34,
+        # 行少时按内容收紧,行多时给大屏一个高值填满视口(dataframe 不支持 stretch)
+        height=min(1000, 44 + 34 * len(rows)),
+        column_config={
+            "检测时间": st.column_config.TextColumn(width="small", pinned=True),
+            # 主键要能整串核对,不能截断 → medium(已 pinned,横滚时仍可见)
+            "Review ID": st.column_config.TextColumn(width="medium", pinned=True),
+            "站点": st.column_config.TextColumn(width="small"),
+            "状态": st.column_config.TextColumn(width="small"),
+            "标题": st.column_config.TextColumn(width="medium"),
+            "原页面": st.column_config.LinkColumn(width="small", display_text="打开"),
+        })
+    st.caption(f"共 {len(rows)} 条(最多显示 500 条)")
 
 def run_check(refs):
     """执行检测任务"""
@@ -661,33 +1110,55 @@ def run_check(refs):
 
 # ---------- 侧边栏 ----------
 
+@st.dialog("IP 热度(近 24h)", width="medium")
+def heat_dialog():
+    heat = heat_stats()
+    if not heat:
+        st.caption("暂无检测数据")
+        return
+    st.dataframe(
+        [{"站点": d.replace("amazon.", ""), "检测": total,
+          "被拦截": blocked or 0, "拦截率": (blocked or 0) / total}
+         for d, total, blocked in heat],
+        hide_index=True, use_container_width=True,
+        column_config={"拦截率": st.column_config.ProgressColumn(
+            format="percent", min_value=0, max_value=1)})
+    st.caption("拦截率 <5% 正常;5~20% 建议降频;>20% 暂停或更换出口 IP")
+
+
+NAV_PAGES = {
+    "评价链接检测": ":material/fact_check:",
+    "检测历史": ":material/history:",
+    "页面链接跟踪": ":material/track_changes:",
+}
+
 with st.sidebar:
-    st.markdown("### AmReview")
+    st.markdown("#### AmReview")
     st.caption("Amazon 评价链接批量检测")
+
+    # 页面切换:radio 保持在同一 session 内切换,输入与检测结果不丢失
+    # (st.navigation 会整页重载并重置 session_state,实测不可用)
+    page = st.radio("页面", list(NAV_PAGES), key="nav_page",
+                    format_func=lambda p: p, label_visibility="collapsed")
+
     st.divider()
 
     status = login_status()
     online = sum(1 for v in status.values() if v["ok"])
-    if st.button(f"Amazon 账号登录 ({online}/{len(status)})", use_container_width=True):
+    st.caption("账号与运行状态")
+    if st.button(f"账号登录 {online}/{len(status)}", icon=":material/key:",
+                 use_container_width=True,
+                 help="维护各站点 Amazon 登录态"):
         login_dialog()
-    if st.button("系统维护", use_container_width=True):
+    if st.button("IP 热度", icon=":material/speed:", use_container_width=True,
+                 help="近 24h 各站拦截率,IP 是否被加热的早期信号"):
+        heat_dialog()
+    if st.button("系统维护", icon=":material/settings:", use_container_width=True,
+                 help="Playwright 升级、数据库信息与服务重启"):
         system_dialog()
-    st.divider()
 
-    # 页面切换:radio 在同一 session 内切换,输入与检测结果不丢失
-    # (st.navigation 会整页重载并重置 session_state,实测不可用)
-    page = st.radio("页面", ["评价链接检测", "检测历史", "页面链接跟踪"],
-                    label_visibility="collapsed", key="nav_page")
-
-    with st.expander("IP 热度（近 24h）", expanded=False):
-        heat = heat_stats()
-        if heat:
-            for domain, total, blocked in heat:
-                rate = (blocked or 0) / total
-                st.markdown(f"- {domain}: 拦截率 {rate:.0%}（{blocked or 0}/{total} 条）")
-            st.caption("拦截率 <5% 正常;5~20% 建议降频;>20% 暂停或更换出口 IP")
-        else:
-            st.caption("暂无检测数据")
+    if online < len(status):
+        st.caption(f"{len(status) - online} 个站点未登录,检测会判为登录失效")
 
 # ---------- 页面渲染 ----------
 
