@@ -3,7 +3,7 @@
 布局规范(只用 Streamlit 公共组件,不手搓 HTML 组件):
 - 主体:一行工具条 + 一张全字段记录表(可排序/可点开验证),表外不铺内容
 - 验证:选中行 → 行内详情条(判定依据 + 原页面链接 + 截图弹窗 + 历史轨迹)
-- 辅助:分站统计、状态汇总、截图证据、演示数据、账号与维护 → 弹窗或侧边栏
+- 辅助:分站统计、状态汇总、截图证据、账号与维护 → 弹窗或侧边栏;演示数据 → 侧边栏
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
+import tracking_ui
 import weblogin
 from engine import STATUS_LABEL, ReviewChecker, parse_links
 
@@ -99,6 +100,15 @@ def init_db():
                 review_id TEXT, domain TEXT, url TEXT, status TEXT,
                 stars TEXT, title TEXT, author TEXT, review_date TEXT,
                 note TEXT, checked_at TEXT
+            )""")
+
+        # 页面/产品链接跟踪表:快照与状态变化(价格/评分/评价数/上下架)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tracking (
+                asin TEXT, domain TEXT, url TEXT, status TEXT,
+                title TEXT, price TEXT, rating TEXT, review_count TEXT,
+                availability TEXT, note TEXT, checked_at TEXT,
+                prev_status TEXT, prev_price TEXT, prev_time TEXT
             )""")
 
         # 为未来扩展预留：产品检测历史表
@@ -345,7 +355,6 @@ def load_mock_results():
         for m in MOCK_RESULTS if m["prev_status"]
     }
     save_history(results)
-    st.rerun()
 
 
 # 历史视图示例:68 条记录(固定18条 + 追加50条),用于检查长表格展示
@@ -419,9 +428,144 @@ def load_mock_history():
         )
 
 
+# 全站演示数据的全集:结果视图 + 历史视图的所有 review_id,卸载时据此清空
+MOCK_IDS = tuple({r["review_id"] for r in MOCK_RESULTS} | {h[0] for h in MOCK_HISTORY})
+
+
+def _delete_mock_rows():
+    with _db() as conn:
+        conn.executemany("DELETE FROM history WHERE review_id = ?",
+                         [(i,) for i in MOCK_IDS])
+
+
+def load_all_mock():
+    """载入全站演示数据:结果视图(含截图) + 历史视图长列表 + 页面跟踪。"""
+    load_mock_results()
+    load_mock_history()
+    load_mock_tracking()
+
+
+def unload_all_mock():
+    """卸载全站演示数据:清空本轮结果并删除数据库里的演示记录。"""
+    st.session_state["results"] = []
+    st.session_state["tracking"] = []
+    st.session_state.pop("prev", None)
+    _delete_mock_rows()
+    _delete_mock_tracking()
+
+
+# ---------- 页面/产品链接跟踪演示数据 ----------
+
+# 跟踪视图示例:覆盖 5 种状态、6 个站点,带上一条对比(状态/价格变化)
+# 字段 = 产品页快照:标题、价格、评分、评价数、上下架;checked_at 为最近一次快照
+MOCK_TRACKING = [
+    {
+        "asin": "B0TRACK0001", "domain": "amazon.com", "status": "alive",
+        "title": "Wireless Earbuds with Charging Case",
+        "price": "$29.99", "rating": "4.4", "review_count": "12,847",
+        "availability": "In Stock", "note": "", "checked_at": "2026-08-22 03:00:00",
+        "url": "https://www.amazon.com/dp/B0TRACK0001/",
+        "prev_status": "alive", "prev_price": "$32.99", "prev_time": "2026-08-21 03:00:00",
+    },
+    {
+        "asin": "B0TRACK0002", "domain": "amazon.in", "status": "alive",
+        "title": "Stainless Steel Water Bottle 1L",
+        "price": "₹799", "rating": "4.2", "review_count": "3,412",
+        "availability": "In Stock", "note": "价格较上次下调", "checked_at": "2026-08-22 02:30:00",
+        "url": "https://www.amazon.in/dp/B0TRACK0002/",
+        "prev_status": "alive", "prev_price": "₹849", "prev_time": "2026-08-21 02:30:00",
+    },
+    {
+        "asin": "B0TRACK0003", "domain": "amazon.com.au", "status": "deleted",
+        "title": "Portable Blender Juicer Cup",
+        "price": "", "rating": "", "review_count": "", "availability": "",
+        "note": "现评已删·HTTP 404 · Page Not Found", "checked_at": "2026-08-22 02:00:00",
+        "url": "https://www.amazon.com.au/dp/B0TRACK0003/",
+        "prev_status": "alive", "prev_price": "A$39.00", "prev_time": "2026-08-21 02:00:00",
+    },
+    {
+        "asin": "B0TRACK0004", "domain": "amazon.co.jp", "status": "blocked",
+        "title": "LED Desk Lamp with USB Port",
+        "price": "", "rating": "", "review_count": "", "availability": "",
+        "note": "重试 3 次仍被拦截(guard/captcha 拦截),建议稍后复测", "checked_at": "2026-08-22 01:30:00",
+        "url": "https://www.amazon.co.jp/dp/B0TRACK0004/",
+        "prev_status": "alive", "prev_price": "¥2,980", "prev_time": "2026-08-21 01:30:00",
+    },
+    {
+        "asin": "B0TRACK0005", "domain": "amazon.com.mx", "status": "login_expired",
+        "title": "Soporte para Laptop de Aluminio",
+        "price": "", "rating": "", "review_count": "", "availability": "",
+        "note": "跳转登录页,需重新引导登录该站点 Amazon 账号", "checked_at": "2026-08-22 01:00:00",
+        "url": "https://www.amazon.com.mx/dp/B0TRACK0005/",
+        "prev_status": "alive", "prev_price": "MX$599", "prev_time": "2026-08-21 01:00:00",
+    },
+    {
+        "asin": "B0TRACK0006", "domain": "amazon.com.br", "status": "alive",
+        "title": "Fone de Ouvido Bluetooth TWS",
+        "price": "R$89,90", "rating": "4.6", "review_count": "5,203",
+        "availability": "In Stock", "note": "", "checked_at": "2026-08-22 00:30:00",
+        "url": "https://www.amazon.com.br/dp/B0TRACK0006/",
+        "prev_status": "alive", "prev_price": "R$89,90", "prev_time": "2026-08-21 00:30:00",
+    },
+]
+
+
+def load_mock_tracking():
+    """载入演示跟踪数据:先清理本批演示记录再写入,保证幂等(不重复堆叠)。
+
+    与 load_mock_history 同款处理:tracking 表无唯一约束,直接 INSERT OR REPLACE
+    只会反复追加,点多次"载入演示数据"会把同一批 mock 记录存成多份。
+    """
+    ids = [t["asin"] for t in MOCK_TRACKING]
+    with _db() as conn:
+        conn.executemany("DELETE FROM tracking WHERE asin = ?",
+                         [(i,) for i in ids])
+        conn.executemany(
+            """INSERT INTO tracking
+               (asin, domain, url, status, title, price, rating, review_count,
+                availability, note, checked_at, prev_status, prev_price, prev_time)
+               VALUES (:asin, :domain, :url, :status, :title, :price, :rating,
+                       :review_count, :availability, :note, :checked_at,
+                       :prev_status, :prev_price, :prev_time)""",
+            MOCK_TRACKING,
+        )
+    st.session_state["tracking"] = list(MOCK_TRACKING)
+
+
+MOCK_TRACKING_IDS = tuple(t["asin"] for t in MOCK_TRACKING)
+
+
+def _delete_mock_tracking():
+    with _db() as conn:
+        conn.executemany("DELETE FROM tracking WHERE asin = ?",
+                         [(i,) for i in MOCK_TRACKING_IDS])
+
+
+def recent_tracking(limit: int = 200):
+    """最近跟踪的页面/产品快照(页面链接跟踪视图用)。
+
+    返回字段与 MOCK_TRACKING 对齐(含 url/prev_*),渲染层统一按 dict 取值;
+    若执行为裸元组,页面会在 r["status"] 处抛 tuple indices 错误。
+    """
+    if not DB.exists():
+        return []
+    cols = ("asin", "domain", "url", "status", "title", "price", "rating",
+            "review_count", "availability", "note", "checked_at",
+            "prev_status", "prev_price", "prev_time")
+    with _db() as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM tracking ORDER BY checked_at DESC LIMIT ?",
+            (limit,)).fetchall()]
+
+
 init_db()
 if "results" not in st.session_state:
     st.session_state["results"] = []
+if "tracking" not in st.session_state:
+    st.session_state["tracking"] = []
+if "mock_on" not in st.session_state:
+    st.session_state["mock_on"] = False
 
 
 def load_accounts() -> dict:
@@ -752,23 +896,27 @@ def page_history():
 
 
 def page_link_tracking():
-    page_header("页面链接跟踪", "规划中 · 后端就绪后开放")
-    st.info("跟踪产品/链接页面的快照与状态变化(价格、评分、评价数、上下架等)。",
-            icon=":material/construction:")
+    """页面链接跟踪:取数后交给独立视图模块渲染(筛选/搜索在 tracking_ui 内)。"""
+    rows = st.session_state.get("tracking")
+    if not rows:
+        rows = recent_tracking(200)
+    if not rows:
+        st.info("暂无跟踪数据。载入演示数据或完成一次产品页检测后会显示快照。",
+                icon=":material/track_changes:")
+        return
+    tracking_ui.render(rows)
+
+
+def render_tracking():
+    page_link_tracking()
 
 
 MAX_BATCH = 50  # 批量边界:限速 3~5s/条,50 条约 4 分钟,更多请分批防 IP 过热
 
 
 def render_check_input():
-    """紧凑输入卡:标题条 + 粘贴框 + 解析摘要 + 主按钮,辅助入口收在右侧"""
-    right = page_header("评价链接批量检测", "粘贴链接 · 每条 3~5 秒 · 支持六国站点混贴")
-    with right:
-        with st.container(horizontal=True, horizontal_alignment="right"):
-            with st.popover("演示数据", icon=":material/science:"):
-                st.caption("填充覆盖全部状态/站点的示例数据,仅预览界面,不联网、不影响真实检测")
-                if st.button("载入 6 条演示结果", use_container_width=True):
-                    load_mock_results()
+    """紧凑输入卡:标题条 + 粘贴框 + 解析摘要 + 主按钮"""
+    page_header("评价链接批量检测", "粘贴链接 · 每条 3~5 秒 · 支持六国站点混贴")
 
     with st.container(border=True):
         # 手动写回 session_state:widget 状态在切页不渲染时会被框架清理,
@@ -1036,7 +1184,7 @@ def history_stats_dialog(days):
 
 
 def render_history():
-    """历史回顾:工具条 + 明细表;统计与演示数据收进弹窗。"""
+    """历史回顾:工具条 + 明细表;统计收进弹窗。"""
     days_map = {"近 7 天": 7, "近 30 天": 30, "全部": None}
 
     right = page_header("检测历史", "每次检测自动留存,可按站点/状态排序核对变化")
@@ -1047,11 +1195,6 @@ def render_history():
             days = days_map.get(sel, 7)
             if st.button("统计", icon=":material/bar_chart:"):
                 history_stats_dialog(days)
-            with st.popover("演示数据", icon=":material/science:"):
-                st.caption("追加 68 条固定演示记录,用于预览长列表效果")
-                if st.button("载入演示历史", use_container_width=True):
-                    load_mock_history()
-                    st.rerun()
 
     rows = recent_history(500, days)
     if not rows:
@@ -1140,6 +1283,20 @@ with st.sidebar:
     # (st.navigation 会整页重载并重置 session_state,实测不可用)
     page = st.radio("页面", list(NAV_PAGES), key="nav_page",
                     format_func=lambda p: p, label_visibility="collapsed")
+
+    st.divider()
+
+    st.caption("演示与辅助")
+    if st.button(("卸载演示数据" if st.session_state["mock_on"] else "载入演示数据"),
+                 icon=":material/science:", use_container_width=True,
+                 help="载入覆盖全状态/站点的示例数据,仅预览界面,不联网、不影响真实检测"):
+        if st.session_state["mock_on"]:
+            unload_all_mock()
+            st.session_state["mock_on"] = False
+        else:
+            load_all_mock()
+            st.session_state["mock_on"] = True
+        st.rerun()
 
     st.divider()
 

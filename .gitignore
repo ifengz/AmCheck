@@ -4,6 +4,7 @@
 /doc/progress.md
 /doc/findings.md
 /doc/test/
+.zcode/
 
 # Python
 __pycache__/
@@ -21,3 +22,6 @@ code/graphify-out/
 
 # 浏览器调试缓存
 .playwright-mcp/
+
+# 演示/参考素材截图
+mock_*.jpg
