@@ -1,0 +1,1109 @@
+"""AmReview NiceGUI 版 — 界面层整体重写,业务层(engine/weblogin/monitor)零改动复用。
+
+布局规范(polabel2 DESIGN.md 对齐):
+- 侧边栏 220px 白底右描边;主区 #f1f5f9 + 20px 点阵
+- 页头 44px:左标题(17px/700)+副行(12px),右操作区
+- 表格 13px、行高 30px、粘性表头;状态列彩色药丸徽标
+- 令牌:--pri #2563eb --line #e2e8f0 --ink #1e293b --body #f1f5f9
+
+运行: .venv/bin/python ui.py  (端口 8765;旧 Streamlit 版改用 ./start.sh legacy)
+"""
+
+from __future__ import annotations
+
+import csv
+import html as html_mod
+import io
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+import nicegui.ui as ui
+from nicegui import app, run
+
+import weblogin
+from engine import STATUS_LABEL, ReviewChecker, parse_links
+from monitor import store as monitor_store
+from monitor import demo as monitor_demo
+
+DB = Path(__file__).parent / "history.db"
+MONITOR_DB = Path(__file__).parent / "monitor.db"
+ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
+PROFILE_ROOT = Path.home() / ".amreview" / "profile"
+DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
+           "amazon.com.au", "amazon.co.jp"]
+# 站点显示为两位国家码(US/UK/JP/...),未收录域名回退为去 amazon. 前缀
+DOMAIN_CC = {"amazon.com": "US", "amazon.co.uk": "UK", "amazon.de": "DE",
+             "amazon.co.jp": "JP", "amazon.com.au": "AU", "amazon.in": "IN",
+             "amazon.com.mx": "MX", "amazon.com.br": "BR", "amazon.es": "ES",
+             "amazon.it": "IT", "amazon.fr": "FR", "amazon.ca": "CA"}
+DOMAIN_SHORT = lambda d: DOMAIN_CC.get(d, d.replace("amazon.", ""))
+MAX_BATCH = 50
+
+STATUS_META = {  # status -> (中文, tailwind 药丸 class)
+    "alive": ("正常", "bg-[#dcfce7] text-[#15803d]"),
+    "deleted": ("已删", "bg-[#fee2e2] text-[#b91c1c]"),
+    "blocked": ("被拦截", "bg-[#fef3c7] text-[#b45309]"),
+    "login_expired": ("登录失效", "bg-[#ede9fe] text-[#6d28d9]"),
+    "unknown": ("未知", "bg-[#e2e8f0] text-[#475569]"),
+}
+STATUS_ORDER = ["alive", "deleted", "blocked", "login_expired", "unknown"]
+
+with open(Path(__file__).parent / "style.css") as f:
+    _css = f.read()
+app.add_static_files("/screenshots", str(Path(__file__).parent / "screenshots"))
+# CSS 内联注入:内容随文件改动即变,且无独立 CSS 文件可被浏览器缓存
+ui.add_head_html(f"<style>{_css}</style>", shared=True)
+# 表格「链接」列的全局辅助:复制到剪贴板(http 回退)+ 轻提示
+ui.add_head_html("""<style>
+.link-act {display:inline-flex;align-items:center;gap:2px;}
+.link-act button {border:none;background:none;padding:2px 3px;cursor:pointer;
+  color:#64748b;border-radius:4px;line-height:1;font-size:13px;}
+.link-act button:hover {background:#eff6ff;color:#2563eb;}
+.copy-toast {position:fixed;top:18px;left:50%;transform:translateX(-50%);
+  background:#1e293b;color:#fff;font-size:12px;padding:5px 12px;border-radius:6px;
+  z-index:9999;opacity:0;transition:opacity .15s;pointer-events:none;}
+</style>""", shared=True)
+ui.add_body_html("""<script>
+function copyText(t) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(t); return;
+  }
+  var ta = document.createElement('textarea');
+  ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+}
+function showCopyToast(msg) {
+  var el = document.createElement('div');
+  el.className = 'copy-toast'; el.textContent = msg;
+  document.body.appendChild(el);
+  requestAnimationFrame(function() { el.style.opacity = '1'; });
+  setTimeout(function() { el.style.opacity = '0'; }, 1200);
+  setTimeout(function() { el.remove(); }, 1500);
+}
+</script>""", shared=True)
+
+
+def link_cell(url: str) -> str:
+    """表格「链接」列:新窗口打开 + 一键复制(行内小图标)。
+
+    事件带 stopPropagation,避免触发 AGGrid 的 cellClicked 行详情弹窗。
+    """
+    u = html_mod.escape(url, quote=True)
+    return (f'<span class="link-act">'
+            f'<button title="打开原页面" onclick="window.open(\'{u}\',\'_blank\')">'
+            f'↗</button>'
+            f'<button title="复制链接" '
+            f'onclick="copyText(\'{u}\');showCopyToast(\'链接已复制\')">'
+            f'⧉</button>'
+            f'</span>')
+
+# ---------- 数据层(与旧 app.py 相同的 SQL,平移过来) ----------
+
+
+def _db():
+    return sqlite3.connect(DB, timeout=10)
+
+
+def init_db():
+    with _db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS history (
+            review_id TEXT, domain TEXT, url TEXT, status TEXT,
+            stars TEXT, title TEXT, author TEXT, review_date TEXT,
+            note TEXT, checked_at TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS tracking (
+            asin TEXT, domain TEXT, url TEXT, status TEXT,
+            title TEXT, price TEXT, rating TEXT, review_count TEXT,
+            availability TEXT, note TEXT, checked_at TEXT,
+            prev_status TEXT, prev_price TEXT, prev_time TEXT)""")
+
+
+def save_history(results):
+    with _db() as conn:
+        conn.executemany(
+            """INSERT INTO history (review_id, domain, url, status, stars, title,
+               author, review_date, note, checked_at)
+               VALUES (:review_id, :domain, :url, :status, :stars, :title,
+                       :author, :review_date, :note, :checked_at)""",
+            results)
+
+
+def last_status_map(refs):
+    if not refs or not DB.exists():
+        return {}
+    ids = [r.review_id for r in refs]
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT review_id, status, checked_at FROM history h
+               WHERE checked_at = (SELECT MAX(checked_at) FROM history
+                                   h2 WHERE h2.review_id = h.review_id)
+               AND review_id IN (%s)""" % ",".join("?" * len(ids)),
+            ids).fetchall()
+    return {rid: (STATUS_LABEL.get(s, s), t) for rid, s, t in rows}
+
+
+def recent_history(limit=500, days=None):
+    if not DB.exists():
+        return []
+    where, params = "", []
+    if days:
+        where = "WHERE checked_at >= datetime('now', ?)"
+        params = [f"-{days} days"]
+    with _db() as conn:
+        return conn.execute(
+            f"""SELECT review_id, domain, status, title, checked_at
+                FROM history {where} ORDER BY checked_at DESC LIMIT ?""",
+            params + [limit]).fetchall()
+
+
+def history_stats(days=None):
+    if not DB.exists():
+        return []
+    where, params = "", []
+    if days:
+        where = "WHERE checked_at >= datetime('now', ?)"
+        params = [f"-{days} days"]
+    with _db() as conn:
+        return conn.execute(
+            f"SELECT status, COUNT(*) FROM history {where} GROUP BY status",
+            params).fetchall()
+
+
+def heat_stats():
+    if not DB.exists():
+        return []
+    with _db() as conn:
+        return conn.execute("""
+            SELECT domain, COUNT(*), SUM(status='blocked')
+            FROM history WHERE checked_at >= datetime('now','-1 day')
+            GROUP BY domain""").fetchall()
+
+
+def review_history_timeline(review_id, limit=20):
+    if not DB.exists():
+        return []
+    with _db() as conn:
+        return conn.execute(
+            """SELECT status, stars, title, checked_at FROM history
+               WHERE review_id = ? ORDER BY checked_at DESC LIMIT ?""",
+            (review_id, limit)).fetchall()
+
+
+def login_status():
+    """各站点登录状态;结果缓存 30s,避免每次侧边栏渲染/弹窗打开都读 6 份 cookie 文件。"""
+    global _login_status_cache
+    now = time.time()
+    if _login_status_cache and now - _login_status_cache[0] < 30:
+        return _login_status_cache[1]
+    out = {}
+    for d in DOMAINS:
+        ss = PROFILE_ROOT / d / "storage_state.json"
+        if ss.exists():
+            ok = False
+            try:
+                cookies = json.loads(ss.read_text()).get("cookies", [])
+                ok = any(c.get("name", "").startswith(("at-", "x-"))
+                         and (c.get("expires", -1) < 0 or c.get("expires", 0) > now)
+                         for c in cookies)
+            except Exception:
+                pass
+            out[d] = {"ok": ok, "days": int((now - ss.stat().st_mtime) / 86400)}
+        else:
+            out[d] = {"ok": False, "days": None}
+    _login_status_cache = (now, out)
+    return out
+
+
+_login_status_cache = None
+
+
+def load_accounts():
+    if ACCOUNTS_FILE.exists():
+        try:
+            return json.loads(ACCOUNTS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+ACCOUNTS = load_accounts()
+
+# ---------- 演示数据(直接复用旧 app.py 的构造逻辑) ----------
+
+MOCK_RESULTS = [
+    {"review_id": "R1ALIVE1234", "domain": "amazon.com", "status": "alive",
+     "stars": "4", "title": "Great product, works as expected",
+     "author": "John D.", "review_date": "2026年8月10日", "body": "Worth every penny.",
+     "verified": True, "note": "", "shot_kind": "", "checked_at": "2026-08-22 03:00:05",
+     "url": "https://www.amazon.com/gp/customer-reviews/R1ALIVE1234/",
+     "prev_status": None, "prev_time": ""},
+    {"review_id": "R2DELETED6789", "domain": "amazon.in", "status": "deleted",
+     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+     "verified": False, "note": "正常·08-1 HTTP 404 · Page Not Found",
+     "shot_kind": "deleted", "checked_at": "2026-08-22 03:00:00",
+     "url": "https://www.amazon.in/gp/customer-reviews/R2DELETED6789/",
+     "prev_status": "✅ 正常", "prev_time": "2026-08-22 02:00:30"},
+    {"review_id": "R3BLOCKED1111", "domain": "amazon.com.au", "status": "blocked",
+     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+     "verified": False, "note": "重试 3 次仍被拦截(guard/captcha 拦截),建议稍后复测",
+     "shot_kind": "", "checked_at": "2026-08-22 02:30:00",
+     "url": "https://www.amazon.com.au/gp/customer-reviews/R3BLOCKED1111/",
+     "prev_status": None, "prev_time": ""},
+    {"review_id": "R4LOGIN2222", "domain": "amazon.co.jp", "status": "login_expired",
+     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+     "verified": False, "note": "跳转登录页,需重新引导登录该站点 Amazon 账号",
+     "shot_kind": "", "checked_at": "2026-08-22 02:01:00",
+     "url": "https://www.amazon.co.jp/gp/customer-reviews/R4LOGIN2222/",
+     "prev_status": None, "prev_time": ""},
+    {"review_id": "R5UNKNOWN3333", "domain": "amazon.com.mx", "status": "unknown",
+     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
+     "verified": False, "note": "已删·08-1 HTTP 200 · 无法识别的页面形态",
+     "shot_kind": "unknown", "checked_at": "2026-08-22 02:00:30",
+     "url": "https://www.amazon.com.mx/gp/customer-reviews/R5UNKNOWN3333/",
+     "prev_status": "🐕 已删", "prev_time": "2026-08-22 01:30:00"},
+    {"review_id": "R6ALIVE4444", "domain": "amazon.com.br", "status": "alive",
+     "stars": "5", "title": "Excelente produto!", "author": "Maria S.",
+     "review_date": "2026年8月5日", "body": "Recomendo.", "verified": False,
+     "note": "", "shot_kind": "", "checked_at": "2026-08-22 01:30:30",
+     "url": "https://www.amazon.com.br/gp/customer-reviews/R6ALIVE4444/",
+     "prev_status": None, "prev_time": ""},
+]
+
+
+def _mock_font(size):
+    from PIL import ImageFont
+    for p in ("/System/Library/Fonts/Helvetica.ttc",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+              "/usr/share/fonts/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _make_mock_shot(review_id, kind):
+    shot_dir = Path(__file__).parent / "screenshots"
+    shot_dir.mkdir(parents=True, exist_ok=True)
+    path = shot_dir / f"{review_id}_mock.png"
+    if path.exists():
+        return str(path)
+    try:
+        from PIL import Image, ImageDraw
+        W, H = 900, 400
+        img = Image.new("RGB", (W, H), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, W, 70], fill=(35, 47, 62))
+        d.rectangle([0, 0, 150, 70], fill=(68, 71, 85))
+        d.rectangle([160, 20, 300, 50], fill=(255, 255, 255))
+        d.rectangle([330, 20, 430, 50], fill=(255, 255, 255))
+        d.rectangle([120, 130, 780, 330], outline=(221, 221, 221), width=2)
+        d.rectangle([120, 130, 780, 210], fill=(160, 174, 192))
+        d.text((150, 158), "Sorry", fill=(255, 255, 255), font=_mock_font(36))
+        d.text((150, 240), "we couldn't find that page",
+               fill=(17, 94, 89), font=_mock_font(28))
+        d.text((150, 285), f"演示截图 · {review_id}", fill=(102, 102, 102),
+               font=_mock_font(16))
+        img.save(path)
+    except Exception:
+        pass
+    return str(path)
+
+
+def load_mock_results():
+    results = []
+    for src in MOCK_RESULTS:
+        r = dict(src)
+        r["screenshot"] = _make_mock_shot(r["review_id"], r["shot_kind"]) \
+            if r["shot_kind"] else ""
+        r.pop("shot_kind", None)
+        r.pop("prev_status", None)
+        r.pop("prev_time", None)
+        results.append(r)
+    app.storage.user["results"] = results
+    app.storage.user["prev"] = {
+        m["review_id"]: (m["prev_status"], m["prev_time"])
+        for m in MOCK_RESULTS if m["prev_status"]}
+    save_history(results)
+
+
+MOCK_HISTORY = [
+    ("R1ALIVEDDDD", "amazon.com.au", "alive", "5", "Excellent quality, fast shipping", "Tom H.", "2026-08-22 03:00:30"),
+    ("R1LOGINCCCC", "amazon.com", "login_expired", "", "", "", "2026-08-22 03:00:00"),
+    ("R1ALIVEBBBB", "amazon.com.mx", "alive", "5", "Muy buen producto, lo recomiendo", "Laura G.", "2026-08-22 02:30:30"),
+    ("R1BLOCKEDAAAA", "amazon.com", "blocked", "", "", "", "2026-08-22 02:30:00"),
+    ("R1UNKNOWN9999", "amazon.co.jp", "unknown", "", "", "", "2026-08-22 02:01:00"),
+    ("R1ALIVE8888", "amazon.in", "alive", "4", "बहुत अच्छा उत्पाद, धन्यवाद", "Priya S.", "2026-08-22 02:00:30"),
+    ("R9BLOCKED7777", "amazon.com.au", "blocked", "", "", "", "2026-08-22 02:00:00"),
+    ("R8DELETED6666", "amazon.com", "deleted", "", "", "", "2026-08-22 01:30:30"),
+    ("R7ALIVE5555", "amazon.com", "alive", "5", "Perfect, arrived on time", "Alex K.", "2026-08-22 01:30:00"),
+    ("R1ALIVE1234", "amazon.com", "alive", "4", "Great product, works as expected", "John D.", "2026-08-22 01:00:05"),
+    ("R2DELETED6789", "amazon.in", "deleted", "", "", "", "2026-08-22 01:00:00"),
+    ("R5ALIVE9999", "amazon.com.br", "alive", "5", "Produto excelente!", "Maria S.", "2026-08-21 20:30:00"),
+    ("R6ALIVE1212", "amazon.in", "alive", "4", "Good value for money", "Rohan V.", "2026-08-21 19:00:00"),
+    ("R7ALIVE3434", "amazon.co.jp", "alive", "5", "期待通りの商品でした", "佐藤", "2026-08-21 18:00:00"),
+    ("R4LOGIN2222", "amazon.co.jp", "login_expired", "", "", "", "2026-08-21 15:40:00"),
+    ("R9ALIVE7878", "amazon.com.au", "alive", "4", "Average quality, could be better", "Sam T.", "2026-08-20 10:05:00"),
+    ("R8ALIVE5656", "amazon.com", "alive", "5", "Fast delivery, happy", "Lily W.", "2026-08-20 09:00:00"),
+    ("R5UNKNOWN3333", "amazon.com.mx", "unknown", "", "", "", "2026-08-20 08:00:00"),
+]
+
+
+def _make_mock_history_rows(count=50):
+    statuses = ("alive", "alive", "deleted", "blocked", "login_expired", "unknown")
+    domains = tuple(DOMAINS)
+    titles = {
+        "alive": ("Reliable product, would buy again", "Good quality and quick delivery"),
+        "deleted": ("Review no longer available", "Page removed by the reviewer"),
+        "blocked": ("", ""),
+        "login_expired": ("", ""),
+        "unknown": ("", ""),
+    }
+    rows = []
+    for i in range(1, count + 1):
+        status = statuses[(i - 1) % len(statuses)]
+        title = titles[status][(i - 1) % len(titles[status])]
+        alive = status == "alive"
+        rows.append((
+            f"RMOCK{i:04d}",
+            domains[(i - 1) % len(domains)],
+            status,
+            str(3 + i % 3) if alive else "",
+            title,
+            f"Demo User {i:02d}" if alive else "",
+            f"2026-08-{22 - (i - 1) // 10:02d} {((i - 1) % 10) * 2:02d}:15:00",
+        ))
+    return rows
+
+
+MOCK_HISTORY.extend(_make_mock_history_rows())
+
+
+def load_mock_history():
+    ids = [h[0] for h in MOCK_HISTORY]
+    with _db() as conn:
+        conn.executemany("DELETE FROM history WHERE review_id = ?",
+                         [(i,) for i in ids])
+        conn.executemany(
+            """INSERT INTO history (review_id, domain, url, status, stars, title,
+               author, review_date, note, checked_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?)""",
+            [(rid, domain, f"https://www.{domain}/gp/customer-reviews/{rid}/",
+              status, stars, title, author, check_time)
+             for rid, domain, status, stars, title, author, check_time in MOCK_HISTORY])
+
+
+MOCK_IDS = tuple({r["review_id"] for r in MOCK_RESULTS}
+                 | {h[0] for h in MOCK_HISTORY})
+
+
+def _delete_mock_rows():
+    with _db() as conn:
+        conn.executemany("DELETE FROM history WHERE review_id = ?",
+                         [(i,) for i in MOCK_IDS])
+
+
+def load_all_mock():
+    load_mock_results()
+    load_mock_history()
+    monitor_demo.seed_demo(MONITOR_DB)
+
+
+def unload_all_mock():
+    app.storage.user["results"] = []
+    app.storage.user["tracking"] = []
+    app.storage.user.pop("prev", None)
+    _delete_mock_rows()
+    monitor_store.delete_by_asins(MONITOR_DB, list(monitor_demo.TIMELINES))
+
+
+init_db()
+
+# ---------- 设计系统:可复用的小组件 ----------
+
+# ui.html 在 NiceGUI 3.x 必须显式给 sanitize;本应用的 html() 只承载
+# 内部构造的标记(状态药丸/标题/KPI),用户输入一律走 ui.label/ui.input,
+# 故统一 sanitize=False。
+html = lambda content: ui.html(content, sanitize=False)
+
+
+def pill(status: str):
+    """状态彩色药丸。"""
+    label, cls = STATUS_META.get(status, (status, "bg-[#e2e8f0] text-[#475569]"))
+    return (f'<span class="pill {cls}" style="display:inline-block;padding:1px 8px;'
+            f'border-radius:999px;font-size:12px;font-weight:700;line-height:18px;">'
+            f'{label}</span>')
+
+
+def stars_html(stars) -> str:
+    """星级着色:4~5 星绿色(好评),1~3 星红色(差评),无星级灰色破折号。"""
+    if not str(stars).isdigit():
+        return '<span style="color:#94a3b8">—</span>'
+    n = int(stars)
+    color = "#15803d" if n >= 4 else "#b91c1c"
+    return f'<span style="color:{color};font-weight:600">{n} ★</span>'
+
+
+def page_header(title: str, meta: str = ""):
+    """44px 页头:左标题+副行,右操作区由调用方 fill。"""
+    with ui.row().classes("w-full items-center justify-between min-h-[44px] gap-3"):
+        with ui.column().classes("gap-0"):
+            html(f'<div class="pg-title">{title}</div>')
+            if meta:
+                html(f'<div class="pg-meta">{meta}</div>')
+        yield
+
+
+def kpi_card(label: str, value: str, tone: str = "ink"):
+    """内联统计块:数字+标签横排,六个并排只占一条细卡,不与表格抢空间。"""
+    color = {"ink": "#1e293b", "ok": "#15803d", "danger": "#b91c1c",
+             "warn": "#b45309", "violet": "#6d28d9"}.get(tone, "#1e293b")
+    html(f'<div class="kpi-inline"><span class="kpi-num" '
+         f'style="color:{color}">{value}</span>'
+         f'<span class="kpi-tag">{label}</span></div>')
+
+
+# ---------- 页面:检测 ----------
+
+
+@ui.page("/")
+def page_check():
+    results = app.storage.user.get("results") or []
+
+    with build_shell("/"):
+        if not results:
+            # ── 输入卡视图:页头 + 紧凑输入卡 ──
+            with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
+                html('<div><div class="pg-title">评价链接批量检测</div>'
+                     '<div class="pg-meta">粘贴链接 · 每条 3~5 秒 · 支持六国站点混贴</div></div>')
+            with ui.card().classes("app-card w-full"):
+                html('<div class="card-title">待检测链接</div>')
+                ta = ui.textarea(placeholder="每行一条,六国站点可混贴\n"
+                                            "https://www.amazon.com/gp/customer-reviews/R1XXXXXXX/")
+                ta.classes("w-full").props("outlined dense rows=7").style("font-size:13px")
+                with ui.row().classes("w-full items-center justify-between"):
+                    html('<div class="pg-meta">支持 /gp/customer-reviews/、/review/、'
+                         'portal 三种格式</div>')
+                    btn = ui.button("开始检测", icon="play_arrow").props("unelevated no-caps")
+
+                def do_check():
+                    refs = parse_links(ta.value or "")
+                    if not refs:
+                        ui.notify("未解析到有效链接", type="negative")
+                        return
+                    if len(refs) > MAX_BATCH:
+                        refs = refs[:MAX_BATCH]
+                        ui.notify(f"一次最多 {MAX_BATCH} 条,已截取", type="warning")
+                    btn.props("disable loading")
+                    prev = last_status_map(refs)
+                    checker = ReviewChecker()
+
+                    async def _run():
+                        def _work():
+                            out = []
+                            def on_result(i, ref, r):
+                                out.append(r)
+                                prog.set_value((i + 1) / len(refs))
+                                prog_text.set_text(
+                                    f"[{i + 1}/{len(refs)}] {DOMAIN_SHORT(ref.domain)} · "
+                                    f"{ref.review_id} → {STATUS_LABEL.get(r['status'], r['status'])}")
+                            try:
+                                checker.check_batch(refs, on_result=on_result)
+                            except Exception as e:
+                                ui.notify(f"检测中断:{e}", type="negative")
+                            finally:
+                                checker.close()
+                            return out
+                        results_new = await run.io_bound(_work)
+                        if results_new:
+                            save_history(results_new)
+                            app.storage.user["results"] = results_new
+                            app.storage.user["prev"] = prev
+                        ui.navigate.to("/")
+
+                    prog_row = ui.row().classes("w-full")
+                    with prog_row:
+                        prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
+                        prog_text = ui.label("").classes("pg-meta")
+                    prog_row.set_visibility(False)
+                    btn.on("click", do_check)
+        else:
+            # ── 结果视图 ──
+            prev = app.storage.user.get("prev", {})
+            counts = {}
+            for r in results:
+                counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+            # 一行:大标题 | KPI 卡(可点击筛选) | 按钮区
+            filt = app.storage.user.setdefault("res_filter", "all")
+
+            def apply_filter(key):
+                app.storage.user["res_filter"] = key
+                ui.navigate.reload()
+
+            with ui.row().classes("w-full items-center justify-between gap-4 mb-3"):
+                html(f'<div><div class="pg-title">评价链接批量检测</div>'
+                     f'<div class="pg-meta">本轮 {len(results)} 条 · '
+                     f'{results[0]["checked_at"]}</div></div>')
+                # KPI 卡即筛选器:点状态卡只看该状态,再点恢复全部
+                def kpi_btn(label, value, tone, key):
+                    active = filt == key
+                    color = {"ink": "#1e293b", "ok": "#15803d", "danger": "#b91c1c",
+                             "warn": "#b45309", "violet": "#6d28d9"}.get(tone, "#1e293b")
+                    bg = "#eff6ff" if active else "#fff"
+                    bd = "#2563eb" if active else "#e2e8f0"
+                    b = ui.button().props("flat no-caps dense")
+                    b.on("click", lambda e, k=key: apply_filter(
+                        "all" if filt == k else k))
+                    b.style(f"background:{bg};border:1px solid {bd};border-radius:6px;"
+                            "padding:4px 12px;min-height:0;height:32px;cursor:pointer;"
+                            "box-shadow:none;")
+                    with b:
+                        html(f'<span class="kpi-num" style="color:{color}">{value}</span>'
+                             f'<span class="kpi-tag">{label}</span>')
+                with ui.row().classes("items-center gap-2"):
+                    kpi_btn("本轮总数", str(len(results)), "ink", "all")
+                    kpi_btn("正常", str(counts.get("alive", 0)), "ok", "alive")
+                    kpi_btn("已删", str(counts.get("deleted", 0)), "danger", "deleted")
+                    kpi_btn("被拦截", str(counts.get("blocked", 0)), "warn", "blocked")
+                    kpi_btn("登录失效", str(counts.get("login_expired", 0)), "violet",
+                            "login_expired")
+                    kpi_btn("未知", str(counts.get("unknown", 0)), "ink", "unknown")
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("导出 CSV", icon="download").props("outline no-caps dense")
+                    ui.button("新一轮", icon="refresh", on_click=lambda: (
+                        app.storage.user.update(results=[], prev={}, res_filter="all"),
+                        ui.navigate.to("/")
+                    )).props("unelevated no-caps dense color=primary")
+
+            # 结果表(AGGrid:13px、药丸徽标、行点选;受 KPI 卡筛选)
+            shown = [r for r in results if filt == "all" or r["status"] == filt]
+            # 输入乱序时展示仍按国家聚拢(AU/BR/IN/JP/MX/US...),同站点内保持输入顺序
+            shown.sort(key=lambda r: DOMAIN_SHORT(r["domain"]))
+            rows = []
+            for r in shown:
+                p = prev.get(r["review_id"])
+                rows.append({
+                    "status_html": pill(r["status"]),
+                    "status_sort": r["status"],
+                    "review_id": r["review_id"],
+                    "link": link_cell(r["url"]),
+                    "domain": DOMAIN_SHORT(r["domain"]),
+                    "stars": stars_html(r["stars"]),
+                    "vp": "✓" if r["verified"] else "",
+                    "title": r["title"] or "—",
+                    "author": r["author"] or "—",
+                    "review_date": r["review_date"] or "—",
+                    "last": (f"⚠ {p[0].split(' ')[-1]} · {p[1][5:16]}" if p else "—"),
+                    "note": r["note"] or "—",
+                    "checked_at": r["checked_at"][5:16],
+                    "_url": r["url"],
+                    "_id": r["review_id"],
+                })
+            grid = ui.aggrid({
+                "columnDefs": [
+                    {"headerName": "状态", "field": "status_html", "width": 92,
+                     "pinned": "left"},
+                    {"headerName": "Review ID", "field": "review_id", "width": 148,
+                     "pinned": "left"},
+                    {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
+                    {"headerName": "站点", "field": "domain", "width": 62},
+                    {"headerName": "星级", "field": "stars", "width": 62},
+                    {"headerName": "VP", "field": "vp", "width": 56},
+                    {"headerName": "标题", "field": "title", "minWidth": 180},
+                    {"headerName": "作者", "field": "author", "width": 92},
+                    {"headerName": "评价日期", "field": "review_date", "width": 134},
+                    {"headerName": "上次检测", "field": "last", "width": 200},
+                    {"headerName": "判定依据", "field": "note", "width": 220},
+                    {"headerName": "检测时间", "field": "checked_at", "width": 104},
+                ],
+                "rowData": rows,
+                "defaultColDef": {"sortable": True, "resizable": True,
+                                  "suppressMovable": True},
+                "rowHeight": 30,
+            }, html_columns=[0, 2, 4]).classes("w-full ag-dense ag-fill")
+            grid.on("cellClicked", lambda e: detail_dialog(
+                next(r for r in results if r["review_id"] == e.args["data"]["_id"]))
+                if e.args.get("colId") != "link" else None)
+
+
+def detail_dialog(r: dict):
+    """行点选 → 结果详情弹窗。"""
+    label, cls = STATUS_META.get(r["status"], (r["status"], ""))
+    with ui.dialog() as d, ui.card().classes("app-card w-[640px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html(f'<div class="card-title">{label} · {r["review_id"]}</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        if r.get("note"):
+            html(f'<div class="pg-meta">判定依据:{r["note"]}</div>')
+        meta = " · ".join(x for x in (
+            f"{r['stars']} ★" if str(r["stars"]).isdigit() else "",
+            r["author"], r["review_date"],
+            "Verified Purchase" if r["verified"] else "") if x)
+        if meta:
+            html(f'<div class="pg-meta">{meta}</div>')
+        if r.get("title"):
+            html(f'<b style="font-size:13.5px">{r["title"]}</b>')
+        if r.get("body"):
+            ui.label(r["body"]).classes("text-[13px] text-[#475569]")
+        if r.get("screenshot") and Path(r["screenshot"]).exists():
+            ui.image(r["screenshot"]).classes("w-full rounded-md")
+        with ui.row():
+            ui.button("打开原页面", on_click=lambda: ui.open(r["url"], new_tab=True)) \
+                .props("outline no-caps dense icon=open_in_new")
+            if len(review_history_timeline(r["review_id"])) > 1:
+                ui.button("历史轨迹").props("outline no-caps dense")
+    d.open()
+
+
+# ---------- 页面:历史 ----------
+
+
+@ui.page("/history")
+def page_history():
+    with build_shell("/history"):
+        days = {"kw": 7}
+
+        # 页头一行:左「标题+副行(含计数)」,右「时间范围+统计」——紧凑不割裂
+        with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
+            with ui.row().classes("items-center gap-3"):
+                html('<div class="pg-title">检测历史</div>')
+                meta = html('')
+            with ui.row().classes("items-center gap-2"):
+                # 时间范围:三个独立按钮,选中态 = 浅蓝底+蓝字(非实心,与空心按钮同族)
+                range_btns = {}
+                for val, label in [(7, "近 7 天"), (30, "近 30 天"), (None, "全部")]:
+                    def _pick(v=val):
+                        days["kw"] = v
+                        for vv, bb in range_btns.items():
+                            if vv == v:
+                                bb.classes(add="bg-[#eff6ff] text-[#2563eb]")
+                            else:
+                                bb.classes(remove="bg-[#eff6ff] text-[#2563eb]")
+                        load_rows()
+                    range_btns[val] = ui.button(label, on_click=_pick) \
+                        .props("outline no-caps dense")
+                range_btns[7].classes(add="bg-[#eff6ff] text-[#2563eb]")
+                ui.button("统计", icon="bar_chart", on_click=lambda: stats_dialog(days["kw"])) \
+                    .props("outline no-caps dense")
+
+        def h_row(r):
+            label, cls = STATUS_META.get(r[2], (r[2], ""))
+            return {
+                "checked": r[4], "review_id": r[0], "domain": DOMAIN_SHORT(r[1]),
+                "link": link_cell(f"https://www.{r[1]}/gp/customer-reviews/{r[0]}/"),
+                "status_html": pill(r[2]), "title": r[3] or "—",
+            }
+
+        def set_meta(n):
+            days_txt = {7: "近 7 天", 30: "近 30 天", None: "全部时间"}[days["kw"]]
+            meta.set_content(
+                f'<div class="pg-meta">{days_txt} · 共 {n} 条(最多 500) · '
+                f'每次检测自动留存</div>')
+
+        grid = ui.aggrid({
+            "columnDefs": [
+                {"headerName": "检测时间", "field": "checked", "width": 148, "pinned": "left"},
+                {"headerName": "Review ID", "field": "review_id", "width": 148, "pinned": "left"},
+                {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
+                {"headerName": "站点", "field": "domain", "width": 62},
+                {"headerName": "状态", "field": "status_html", "width": 86},
+                {"headerName": "标题", "field": "title", "minWidth": 220},
+            ],
+            "rowData": [],
+            "defaultColDef": {"sortable": True},
+            "rowHeight": 30,
+        }, html_columns=[2, 4]).classes("w-full ag-dense ag-fill")
+
+        def load_rows():
+            data_rows = [h_row(r) for r in recent_history(500, days["kw"])]
+            grid.options["rowData"] = data_rows
+            grid.update()
+            set_meta(len(data_rows))
+
+        load_rows()
+
+
+def stats_dialog(days):
+    stats = history_stats(days)
+    total = sum(c for _, c in stats) or 1
+    with ui.dialog() as d, ui.card().classes("app-card w-[420px]"):
+        html('<div class="card-title">历史状态统计</div>')
+        for s, c in sorted(stats, key=lambda kv: -kv[1]):
+            label, cls = STATUS_META.get(s, (s, ""))
+            pct = c / total
+            with ui.row().classes("w-full items-center gap-2"):
+                html(f'<span class="pill {cls}">{label}</span>')
+                ui.linear_progress(value=pct, show_value=False).classes("flex-grow h-1")
+                ui.label(f"{c} · {pct:.0%}").classes("text-[12px] text-[#64748b]")
+    d.open()
+
+
+# ---------- 页面:监控 ----------
+
+
+@ui.page("/monitor")
+def page_monitor():
+    with build_shell("/monitor"):
+        if not MONITOR_DB.exists() or monitor_store.count_snapshots(MONITOR_DB) == 0:
+            html('<div class="pg-title">链接监控</div>')
+            ui.label("暂无监控数据。侧边栏载入演示数据,或跑一轮采集后显示。") \
+                .classes("text-[13px] text-[#64748b]")
+            return
+
+        from monitor import board as monitor_board
+        data = monitor_board.get_board_data(MONITOR_DB)
+
+        # 页头一行:左「标题+副行摘要」,右「站点筛选+搜索」
+        with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
+            with ui.row().classes("items-center gap-3"):
+                html('<div class="pg-title">链接监控</div>')
+                summary = html('')
+            with ui.row().classes("items-center gap-2"):
+                doms = data["domains"]
+                # 值"全部站点"已自说明,不挂 label(outlined label 必悬浮在框沿,显得挤)
+                sel = ui.select({**{"全部站点": "全部站点"},
+                                 **{d: d for d in doms}}, value="全部站点") \
+                    .props("outlined dense hide-bottom-space") \
+                    .classes("w-36")
+                q = ui.input(placeholder="搜索标题 / ASIN / URL …") \
+                    .props("outlined dense hide-bottom-space") \
+                    .classes("w-64").style("font-size:13px")
+
+        grid_holder = ui.column().classes("w-full")
+
+        def rebuild():
+            from monitor.board import _table_row  # 复用行构造(含上次对比+异常徽标)
+            anom_by_key = {(a["anomaly"]["asin"], a["anomaly"]["domain"]): a["anomaly"]
+                           for a in data["anomalies"]}
+            rows = []
+            for (asin, domain), snap in data["latest"].items():
+                if sel.value != "全部站点" and DOMAIN_SHORT(domain) != sel.value:
+                    continue
+                row = _table_row(MONITOR_DB, asin, domain, snap, anom_by_key)
+                if q.value and q.value.lower() not in json.dumps(
+                        {k: str(v) for k, v in row.items()}).lower():
+                    continue
+                rows.append(row)
+            rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
+            abnormal = sum(1 for r in rows if r["_sev"] < 9)
+            summary.set_content(
+                f'<div class="pg-meta">监控 {data["total"]} 条 · 异常 '
+                f'{data["abnormal_count"]} 条 · 当前显示 {len(rows)} 条</div>')
+            grid_holder.clear()
+            with grid_holder:
+                make_grid(rows)
+
+        def make_grid(rows):
+            def _label(badge: str):
+                for key in ("🚨", "⚠", "ℹ"):
+                    if badge.startswith(key):
+                        sev_cls = {"🚨": "bg-[#fee2e2] text-[#b91c1c]",
+                                   "⚠": "bg-[#fef3c7] text-[#b45309]",
+                                   "ℹ": "bg-[#dbeafe] text-[#1d4ed8]"}[key]
+                        return badge, sev_cls
+                return badge, "bg-[#dcfce7] text-[#15803d]"
+
+            # monitor 侧的中文状态标签 → 我们的药丸映射(两套词表统一)
+            zh_to_key = {"正常": "alive", "已删": "deleted", "被拦截": "blocked",
+                         "下架": "deleted", "登录失效": "login_expired",
+                         "未知": "unknown"}
+            g_rows = []
+            for r in rows:
+                badge, cls = _label(r["异常"])
+                g_rows.append({
+                    "anomaly_html": (f'<span class="pill {cls}">{badge}</span>'
+                                     if badge != "正常" else
+                                     '<span class="pill bg-[#dcfce7] text-[#15803d]">正常</span>'),
+                    "status_html": pill(zh_to_key.get(r["状态"], "unknown")),
+                    "asin": r["ASIN"], "domain": r["站点"], "title": r["标题"],
+                    "price": r["价格"], "rating": r["评分"], "rc": r["评价数"],
+                    "buybox": r["BuyBox"], "avail": r["上下架"], "last": r["上次"],
+                    "ts": r["跟踪时间"], "_asin": r["_asin"], "_domain": r["_domain"],
+                })
+            g = ui.aggrid({
+                "columnDefs": [
+                    {"headerName": "状态", "field": "status_html", "width": 88, "pinned": "left"},
+                    {"headerName": "ASIN", "field": "asin", "width": 110, "pinned": "left"},
+                    {"headerName": "异常", "field": "anomaly_html", "width": 110},
+                    {"headerName": "站点", "field": "domain", "width": 72},
+                    {"headerName": "标题", "field": "title", "minWidth": 200},
+                    {"headerName": "价格", "field": "price", "width": 90},
+                    {"headerName": "评分", "field": "rating", "width": 64},
+                    {"headerName": "评价数", "field": "rc", "width": 72},
+                    {"headerName": "BuyBox", "field": "buybox", "width": 100},
+                    {"headerName": "上下架", "field": "avail", "width": 90},
+                    {"headerName": "上次", "field": "last", "width": 140},
+                    {"headerName": "跟踪时间", "field": "ts", "width": 96},
+                ],
+                "rowData": g_rows,
+                "defaultColDef": {"sortable": True},
+                "rowHeight": 30,
+            }, html_columns=[0, 2]).classes("w-full ag-dense ag-fill")
+            g.on("cellClicked", lambda e: history_dialog(
+                MONITOR_DB, e.args["data"]["_asin"], e.args["data"]["_domain"]))
+
+        sel.on_value_change(lambda e: rebuild())
+        q.on("keydown", lambda e: rebuild() if e.args.get("key") == "Enter" else None)
+        rebuild()
+
+
+def history_dialog(db_path, asin, domain):
+    """监控行点选 → 变化史弹窗(复用 board 的快照与基线逻辑)。"""
+    from monitor import store as ms
+    from monitor.baseline import current_baseline
+    snaps = ms.snapshots_for(db_path, asin, domain)
+    if not snaps:
+        ui.notify("暂无快照")
+        return
+    base = current_baseline(db_path, asin, domain)
+    p = ms.get_profile(db_path, asin, domain)
+    title = (p or {}).get("title", asin)
+    with ui.dialog() as d, ui.card().classes("app-card w-[720px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html(f'<div class="card-title">{title} · {asin}</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        b = base or snaps[0]
+        cur = snaps[-1]
+        from monitor.board import _diff_line
+        html(f'<div class="pg-meta">基线 {(b.get("checked_at") or "")[5:16]} → '
+                f'{(cur.get("checked_at") or "")[5:16]} · {_diff_line(b, cur)}</div>')
+        ui.separator()
+        html('<b style="font-size:13px">变化史(历次快照)</b>')
+        rows = [{
+            "time": (s.get("checked_at") or "")[5:16],
+            "status": s.get("status"),
+            "price": s.get("price") or "—",
+            "bad": (s.get("home_reviews") or {}).get("recent_bad", 0),
+        } for s in reversed(snaps)]
+        ui.aggrid({
+            "columnDefs": [
+                {"headerName": "时间", "field": "time", "width": 110},
+                {"headerName": "状态", "field": "status", "width": 90},
+                {"headerName": "价格", "field": "price", "width": 110},
+                {"headerName": "新增差评", "field": "bad", "width": 90},
+            ],
+            "rowData": rows, "rowHeight": 28,
+        }).classes("w-full ag-dense")
+        with ui.row():
+            if p and p.get("url"):
+                ui.button("打开原页面", on_click=lambda: ui.open(p["url"], new_tab=True)) \
+                    .props("outline no-caps dense icon=open_in_new")
+            from monitor.board import _has_unconfirmed
+            if _has_unconfirmed(db_path, asin, domain):
+                def _confirm():
+                    from monitor.pipeline import confirm_and_move_baseline
+                    confirm_and_move_baseline(db_path, asin, domain)
+                    for an in ms.unconfirmed_anomalies(db_path, limit=500):
+                        if an["asin"] == asin and an["domain"] == domain:
+                            ms.confirm_anomaly(db_path, an["id"])
+                    d.close()
+                    ui.notify("已确认,基线前移", type="positive")
+                    ui.navigate.to("/monitor")
+                ui.button("确认无误 → 前移基线", on_click=_confirm) \
+                    .props("unelevated no-caps dense color=primary icon=verified")
+            else:
+                ui.label("该链路当前无未确认异常").classes("pg-meta")
+    d.open()
+
+
+# ---------- 弹窗:登录 / IP 热度 / 系统维护 ----------
+
+
+def login_dialog():
+    status = login_status()
+    acct_keys = {k for k in ACCOUNTS if not k.startswith("_")}
+    domains = [d for d in ["amazon.in", "amazon.com", "amazon.com.au",
+                           "amazon.co.jp", "amazon.com.br", "amazon.com.mx"]
+               if d in (set(DOMAINS) | acct_keys)]
+    with ui.dialog() as d, ui.card().classes("app-card w-[440px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">Amazon 账号登录管理</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        sel = ui.select({d: f"{d} · {'已登录 ' + str(status[d]['days']) + 'd' if status.get(d, {}).get('ok') else '未登录'}"
+                         for d in domains}, value=domains[0]) \
+            .props("outlined dense").classes("w-full")
+        account = ui.input("Amazon 账号").props("outlined dense").classes("w-full")
+        password = ui.input("账号密码", password=True).props("outlined dense").classes("w-full")
+        totp = ui.input("TOTP 密钥(可选)", password=True).props("outlined dense").classes("w-full")
+        code = ui.input("验证码", placeholder="仅未配 TOTP 且停在验证码页时需要") \
+            .props("outlined dense").classes("w-full")
+        msg = ui.label("").classes("pg-meta")
+        img_holder = ui.column().classes("w-full")
+
+        def _do(kind):
+            dom = sel.value
+            sess = weblogin.get_session(dom)
+            try:
+                if kind == "login":
+                    weblogin.close_domains({dom})
+                    m, img = sess.auto_login(account.value, password.value, totp.value.strip())
+                elif kind == "code":
+                    k = "otp" if sess.page.query_selector(
+                        "#auth-mfa-otpcode, input[name='otpCode']") is not None else "captcha"
+                    m, img = sess.submit_code(k, code.value)
+                else:  # check
+                    ok = sess.logged_in()
+                    m, img = (f"✅ {dom} 登录态已保存", None) if ok else ("未登录", sess.shot())
+                msg.set_text(m)
+                img_holder.clear()
+                if img:
+                    with img_holder:
+                        ui.image(img).classes("w-full rounded-md")
+            except Exception as e:
+                msg.set_text(f"出错:{e.__class__.__name__}: {e}")
+
+        with ui.row().classes("w-full gap-2"):
+            ui.button("开始登录", on_click=lambda: _do("login")) \
+                .props("unelevated no-caps color=primary").classes("flex-grow")
+            ui.button("提交验证码", on_click=lambda: _do("code")) \
+                .props("outline no-caps").classes("flex-grow")
+        ui.button("检测登录态", on_click=lambda: _do("check")) \
+            .props("outline no-caps").classes("w-full")
+    d.open()
+
+
+def heat_dialog():
+    heat = heat_stats()
+    with ui.dialog() as d, ui.card().classes("app-card w-[420px]"):
+        html('<div class="card-title">IP 热度(近 24h)</div>')
+        if not heat:
+            ui.label("暂无检测数据").classes("pg-meta")
+        for dom, total, blocked in heat:
+            pct = (blocked or 0) / total
+            tone = "text-[#b91c1c]" if pct > .2 else ("text-[#b45309]" if pct > .05 else "text-[#15803d]")
+            with ui.row().classes("w-full items-center gap-2"):
+                ui.label(DOMAIN_SHORT(dom)).classes("w-16 text-[13px]")
+                ui.linear_progress(value=pct, show_value=False).classes("flex-grow h-1")
+                ui.label(f"{pct:.0%}").classes(f"text-[12px] {tone}")
+        html('<div class="pg-meta">拦截率 <5% 正常;5~20% 建议降频;>20% 暂停或更换出口 IP</div>')
+    d.open()
+
+
+def _latest_pypi(pkg):
+    try:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/json", timeout=5) as r:
+            return json.load(r)["info"]["version"]
+    except Exception:
+        return None
+
+
+def system_dialog():
+    with ui.dialog() as d, ui.card().classes("app-card w-[460px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">系统维护</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        try:
+            import importlib.metadata
+            cur = importlib.metadata.version("playwright")
+        except Exception:
+            cur = "未知"
+        # 版本信息先渲染当前版本;PyPI 最新版后台异步查询,不阻塞弹窗打开
+        # (pypi.org 国内直连可能数秒,同步查会卡住整个弹窗)
+        ver_row = html(f'<div class="text-[13px]">Playwright 当前版本: '
+                       f'<code>{cur}</code> · PyPI 最新: <span class="pg-meta">查询中…</span></div>')
+
+        async def _load_latest():
+            top = await run.io_bound(_latest_pypi, "playwright")
+            if top:
+                ver_row.set_content(
+                    f'<div class="text-[13px]">Playwright 当前版本: <code>{cur}</code>'
+                    f' · PyPI 最新: <code>{top}</code></div>')
+
+        ui.timer(0.1, _load_latest, once=True)
+        log = ui.log(max_lines=12).classes("w-full h-48")
+
+        async def do_upgrade():
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "-U", "playwright"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+            def _pump():
+                for line in proc.stdout:
+                    log.push(line.rstrip())
+                proc.wait()
+                log.push("完成,重启服务后生效")
+
+            await run.io_bound(_pump)
+
+        ui.button("升级 Playwright", on_click=do_upgrade) \
+            .props("unelevated no-caps color=primary").classes("w-full")
+        ui.button("重启服务", on_click=lambda: (
+            os.execv(sys.executable,
+                    [sys.executable, "-m", "nicegui", "run", str(Path(__file__))]))) \
+            .props("outline no-caps").classes("w-full")
+    d.open()
+
+
+# ---------- 侧边栏与布局 ----------
+
+
+@ui.refreshable
+def sidebar_nav():
+    status = login_status()
+    online = sum(1 for v in status.values() if v["ok"])
+    with ui.column().classes("gap-0 w-full"):
+        with ui.row().classes("items-center gap-2.5 px-3 py-2"):
+            html('<div class="brand-mark">A</div>')
+            html('<div><div class="brand-name">AmReview</div>'
+                    '<div class="brand-sub">Amazon 评价链接批量检测</div></div>')
+        ui.separator()
+        for path, icon, label in [("/", "fact_check", "评价链接检测"),
+                                  ("/history", "history", "检测历史"),
+                                  ("/monitor", "monitoring", "链接监控")]:
+            active = app.storage.user.get("_nav") == path
+            ui.link(label, path).classes(f"nav-item {'nav-active' if active else ''}") \
+                .props(f'icon={icon}')
+        ui.separator()
+        html('<div class="nav-group">演示与辅助</div>')
+        ui.button(("卸载演示数据" if app.storage.user.get("mock_on") else "载入演示数据"),
+                  icon="science", on_click=toggle_mock).props("flat no-caps align=left")
+        ui.separator()
+        html('<div class="nav-group">账号与运行状态</div>')
+        ui.button(f"账号登录 {online}/{len(status)}", icon="key", on_click=login_dialog) \
+            .props("flat no-caps align=left")
+        ui.button("IP 热度", icon="speed", on_click=heat_dialog) \
+            .props("flat no-caps align=left")
+        ui.button("系统维护", icon="settings", on_click=system_dialog) \
+            .props("flat no-caps align=left")
+        if online < len(status):
+            html(f'<div class="pg-meta" style="padding:0 12px">'
+                    f'{len(status) - online} 个站点未登录,检测会判为登录失效</div>')
+
+
+def toggle_mock():
+    if app.storage.user.get("mock_on"):
+        unload_all_mock()
+        app.storage.user["mock_on"] = False
+    else:
+        load_all_mock()
+        app.storage.user["mock_on"] = True
+    ui.navigate.reload()
+
+
+@contextmanager
+def build_shell(nav: str):
+    """侧边栏 + 主区框架;每页开头 with build_shell(路径): 渲染页面内容。"""
+    app.storage.user["_nav"] = nav
+    with ui.row().classes("shell-row m-0 p-0 gap-0"):
+        with ui.column().classes("sidebar"):
+            sidebar_nav()
+        with ui.column().classes("main-area flex-grow items-stretch"):
+            yield
+
+
+ui.run(title="AmReview 评价检测", port=8765, reload=False, show=False,
+       storage_secret="amreview-secret", favicon="🔍",
+       show_welcome_message=False)

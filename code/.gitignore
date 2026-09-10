@@ -2,7 +2,13 @@
 __pycache__/
 *.pyc
 history.db
+monitor.db
 screenshots/
 accounts.json
 .DS_Store
 graphify-out/
+.nicegui/
+shots_ng/
+ui_screenshots_polabel2_style/
+_ng_shots.py
+monitor/screenshots/

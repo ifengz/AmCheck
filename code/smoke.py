@@ -26,7 +26,12 @@ def step(name: str, fn) -> bool:
 
 
 def check_compile():
-    for f in ("app.py", "engine.py", "weblogin.py", "login.py"):
+    # 核心模块 + monitor 包(看板/规则/存储,统一纳入编译覆盖,防大改后语法漏检)
+    files = ["app.py", "engine.py", "weblogin.py", "login.py",
+             "monitor/board.py", "monitor/store.py", "monitor/rules.py",
+             "monitor/pipeline.py", "monitor/address.py", "monitor/model.py",
+             "monitor/baseline.py", "monitor/demo.py"]
+    for f in files:
         r = subprocess.run([PY, "-m", "py_compile", str(CODE / f)],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
@@ -62,6 +67,43 @@ def check_totp():
     assert totp_code(s) == pyotp.TOTP(s).now()
 
 
+def check_monitor():
+    """链接异常监控(阶段1-3):用临时库造演示数据,验证三表追加 + 规则 + 看板聚合。"""
+    import tempfile
+    from pathlib import Path
+    sys.path.insert(0, str(CODE))
+    from monitor import store
+    from monitor.demo import seed_demo
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "monitor.db"
+        # 1) 种子:写入 profiles + snapshots(追加式),并触发 anomalies
+        n = seed_demo(db)
+        assert n >= 10, f"演示种子应写入多条快照,实际 {n}"
+        assert store.count_snapshots(db) == n
+        # 2) 三表齐全
+        assert len(store.list_profiles(db)) == 7
+        bad = store.unconfirmed_anomalies(db)
+        assert len(bad) >= 3, f"异常应命中多条,实际 {len(bad)}"
+        # 3) 规则能对稳定类(丢BuyBox)+动态类(价格)都判出异常
+        metrics = {a["metric"] for a in bad}
+        assert "buybox" in metrics, f"缺少丢BuyBox异常: {metrics}"
+        # 4) 基线可前移 + 确认闭环
+        from monitor.pipeline import confirm_and_move_baseline
+        a = bad[0]
+        confirm_and_move_baseline(db, a["asin"], a["domain"])
+        store.confirm_anomaly(db, a["id"])
+        remaining_ids = {item["id"] for item in store.unconfirmed_anomalies(db)}
+        expected_ids = {item["id"] for item in bad if item["id"] != a["id"]}
+        assert remaining_ids == expected_ids, (
+            f"确认应只移除目标异常 {a['id']},实际剩余: {remaining_ids}"
+        )
+        # 5) 看板聚合正常
+        from monitor.board import get_board_data
+        data = get_board_data(db)
+        assert data["total"] == 7
+        assert data["abnormal_count"] >= 1
+
+
 def check_live():
     sys.path.insert(0, str(CODE))
     from engine import ReviewChecker, parse_links
@@ -78,6 +120,7 @@ if __name__ == "__main__":
         step("导入引擎/登录模块", check_imports),
         step("链接解析(六国 allowlist + 三格式 + 去重 + 拒非法域名)", check_parse),
         step("TOTP 算码", check_totp),
+        step("异常监控(三表+规则+基线+看板聚合)", check_monitor),
     ])
     if live:
         ok = step("实测:假 ID 应判 🐕 已删(走真实 Amazon)", check_live) and ok

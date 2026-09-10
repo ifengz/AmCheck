@@ -122,8 +122,9 @@ def parse_links(text: str, default_domain: str = "amazon.com") -> list[ReviewRef
     for line in text.splitlines():
         for token in line.split():
             ref = parse_link(token, default_domain)
-            if ref and ref.review_id not in seen:
-                seen.add(ref.review_id)
+            key = (ref.domain, ref.review_id) if ref else None
+            if key and key not in seen:
+                seen.add(key)
                 refs.append(ref)
     return refs
 

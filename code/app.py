@@ -24,11 +24,15 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
-import tracking_ui
 import weblogin
 from engine import STATUS_LABEL, ReviewChecker, parse_links
+from monitor import board as monitor_board
+from monitor import store as monitor_store
+from monitor import demo as monitor_demo
+from monitor.pipeline import add_profile, run_round
 
 DB = Path(__file__).parent / "history.db"
+MONITOR_DB = Path(__file__).parent / "monitor.db"  # monitor 三表独立库
 ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
 PROFILE_ROOT = Path.home() / ".amreview" / "profile"
 DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
@@ -36,42 +40,167 @@ DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
 
 st.set_page_config(page_title="AmReview 评价检测", page_icon="🔍", layout="wide")
 
-# SaaS 密度:只压间距,不改组件外观(组件一律用 Streamlit 原生)
+# 设计系统:对齐 polabel2 DESIGN.md(紧凑仓库控制室风)。
+# 令牌:--primary #2563eb / --line #e2e8f0 / --body #f1f5f9 / --ink #1e293b。
+# 密度:表格 13px、控件 32px、行高 28px;白侧边栏 + 点阵主区。
 st.markdown("""<style>
-/* 顶距压到 1rem:原 2.4rem 在标题上方留了大片空白,空间让给表格 */
-.block-container {padding-top: 1rem; padding-bottom: .8rem; max-width: 1500px;}
-[data-testid="stSidebarUserContent"] {padding-top: 1rem;}
-[data-testid="stVerticalBlockBorderWrapper"] h1,
-[data-testid="stVerticalBlockBorderWrapper"] h2,
-[data-testid="stVerticalBlockBorderWrapper"] h3 {margin-top: 0;}
-h1, h2, h3 {letter-spacing: -.01em;}
-/* 共用标题条:固定行高,三页基线一致;替代 subheader 的 62px 高度 */
-.pg-title {font-size: 1.32rem; font-weight: 700; line-height: 1.9rem;
-           letter-spacing: -.01em; margin: 0;}
-.pg-meta {font-size: .78rem; line-height: 1.1rem; opacity: .6; margin: .1rem 0 0;}
-/* 表格上方的操作提示:与副行同字号同弱化,右对齐贴住它描述的那张表。
-   行高取 segmented_control 的 40px,并清掉 Streamlit 给 markdown 容器的
-   -16px 下边距 —— 否则该列量出来只有 24px,列的 center 对齐会低 8px。 */
-.pg-hint {font-size: .78rem; opacity: .6; margin: 0; text-align: right;
-          line-height: 40px;}
+:root {
+  --pri: #2563eb; --pri-hover: #1d4ed8; --pri-light: #eff6ff; --pri-soft: #dbeafe;
+  --ok: #10b981; --ok-light: #dcfce7; --warn: #f59e0b; --warn-light: #fef3c7;
+  --danger: #ef4444; --danger-light: #fee2e2;
+  --ink: #1e293b; --ink-sub: #64748b; --ink-muted: #94a3b8;
+  --line: #e2e8f0; --body: #f1f5f9; --card: #ffffff;
+}
+/* 主区:点阵背景(polabel2 §10.5),容器左右收紧让表格吃满宽度 */
+.stApp {background: var(--body);}
+[data-testid="stAppViewContainer"] {
+  background-image: radial-gradient(#d3dce6 1px, transparent 1px);
+  background-size: 20px 20px;
+  background-color: var(--body);
+}
+.block-container {padding: 1.2rem 1.6rem .8rem; max-width: 1600px;}
+
+/* ── 侧边栏:纯白 + 右描边,导航条化 ── */
+[data-testid="stSidebar"] {
+  background: var(--card); border-right: 1px solid var(--line);
+}
+[data-testid="stSidebar"] hr {margin: .5rem 0; border-color: var(--line);}
+[data-testid="stSidebarUserContent"] {padding-top: .8rem;}
+/* 导航 radio → 菜单项:去掉圆圈,整行高亮,选中蓝底 */
+[data-testid="stSidebar"] [data-testid="stRadio"] div[role="radiogroup"] {gap: 2px;}
+[data-testid="stSidebar"] [data-testid="stRadio"] label {
+  padding: 7px 10px; border-radius: 6px; margin: 1px 0; gap: 8px;
+  border: none; transition: background .12s;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {background: #f8fafc;}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(:checked) {
+  background: var(--pri-light);
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(:checked) p {
+  color: var(--pri); font-weight: 700;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p {font-size: 13px; line-height: 1.35;}
+/* 隐藏 radio 圆圈只留文字,像菜单项 */
+[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stMarkdownContainer"] {margin-bottom: 0;}
+/* 隐藏 radio 圆圈只留文字,像菜单项 */
+[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {display: none;}
+/* 侧边栏按钮:36px 高、描边、13px,左对齐更像菜单项 */
+[data-testid="stSidebar"] [data-testid="stButton"] button {
+  min-height: 34px; padding: 5px 12px; font-size: 13px; font-weight: 600;
+  border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: none; justify-content: flex-start;
+}
+[data-testid="stSidebar"] [data-testid="stButton"] button:hover {background: #f8fafc;}
+[data-testid="stSidebar"] [data-testid="stButton"] button p {font-size: 13px;}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+  font-size: 11px; color: var(--ink-muted); letter-spacing: .02em;
+}
+
+/* ── 标题与文字:polabel2 字阶 ── */
+.pg-title {font-size: 17px; font-weight: 700; line-height: 1.6rem;
+           letter-spacing: -.01em; margin: 0; color: var(--ink);}
+.pg-meta {font-size: 12px; line-height: 1rem; margin: .05rem 0 0; color: var(--ink-sub);}
+.pg-hint {font-size: 12px; color: var(--ink-muted); margin: 0; text-align: right;
+          line-height: 36px;}
 [data-testid="stMarkdownContainer"]:has(.pg-hint) {margin-bottom: 0;}
-/* 标题条锁定 48px:无按钮的页面(如跟踪页)列高不会塌,三页基线严格对齐 */
-[data-testid="stHorizontalBlock"]:has(.pg-title) {min-height: 48px; gap: .5rem;}
-/* 文字类分区收紧,把纵向空间让给表格 */
-[data-testid="stCaptionContainer"] p {font-size: .78rem; line-height: 1.25;
-                                      margin-bottom: 0;}
-[data-testid="stAlert"] {padding: 0; margin: .35rem 0;}
-[data-testid="stAlert"] p {font-size: .82rem; line-height: 1.3; margin-bottom: 0;}
-/* 提示条真实高度来自内层容器(图标撑起 52px),压这里才有效 */
-[data-testid="stAlert"] .stAlertContainer {padding: .45rem .7rem; min-height: 0;}
+[data-testid="stHorizontalBlock"]:has(.pg-title) {min-height: 44px; gap: .5rem;
+                                                   margin-bottom: .25rem;}
+[data-testid="stCaptionContainer"] p {font-size: 12px; line-height: 1.3;
+                                      margin-bottom: 0; color: var(--ink-sub);}
+
+/* ── 控件密度:36px 工具条 / 32px 分段控件,同排对齐 ── */
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button,
+[data-testid="stLinkButton"] button {
+  min-height: 32px; padding: 4px 12px; font-size: 13px; font-weight: 600;
+  border-radius: 6px; box-shadow: none;
+}
+[data-testid="stButton"] button p, [data-testid="stDownloadButton"] button p,
+[data-testid="stLinkButton"] button p {font-size: 13px;}
+[data-testid="stButton"] button[kind="primary"],
+[data-testid="stDownloadButton"] button[kind="primary"],
+[data-testid="stLinkButton"] button[kind="primary"] {
+  background: var(--pri); border: none;
+}
+[data-testid="stButton"] button[kind="primary"]:hover,
+[data-testid="stDownloadButton"] button[kind="primary"]:hover,
+[data-testid="stLinkButton"] button[kind="primary"]:hover {background: var(--pri-hover);}
+[data-testid="stButton"] button[kind="secondary"],
+[data-testid="stDownloadButton"] button[kind="secondary"],
+[data-testid="stLinkButton"] button[kind="secondary"] {
+  background: var(--card); border: 1px solid var(--line); color: #334155;
+}
+[data-testid="stButtonGroup"] [data-baseweb="button-group"],
+[data-testid="stButtonGroup"] [data-baseweb="button-group"] button {height: 36px;}
+/* 分段控件:紧凑 + 选中蓝底 */
+[data-testid="stSegmentedControl"] {min-height: 32px;}
+[data-testid="stSegmentedControl"] [data-baseweb="button-group"] {height: 32px;}
+[data-testid="stSegmentedControl"] [data-baseweb="button-group"] button {
+  height: 28px; font-size: 12.5px; padding: 2px 10px; min-height: 0;
+}
+[data-testid="stTextInput"] input, [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+  font-size: 13px; min-height: 32px; height: 32px;
+}
+[data-testid="stTextInput"] input {padding: 5px 10px; min-height: 32px; height: 32px;}
+[data-testid="stTextInput"] [data-testid="stTextInputRootElement"] {height: 32px; min-height: 32px;}
+[data-testid="stSelectbox"] svg {height: 16px;}
+/* 徽标 → 药丸(polabel2 §4 Badges:999px/12px/700) */
+[data-testid="stBadge"] {
+  border-radius: 999px; padding: 1px 8px; font-size: 12px; font-weight: 700;
+}
+[data-testid="stBadge"] p {font-size: 12px; font-weight: 700;}
+
+/* 提示条:紧凑警示 */
+[data-testid="stAlert"] {padding: 0; margin: .35rem 0; border-radius: 6px;}
+[data-testid="stAlert"] p {font-size: 12.5px; line-height: 1.35; margin-bottom: 0;}
+[data-testid="stAlert"] .stAlertContainer {padding: .4rem .7rem; min-height: 0;}
 [data-testid="stAlert"] [data-testid="stMarkdownContainer"] {min-height: 0;}
 [data-testid="stElementContainer"]:has(> [data-testid="stMarkdownContainer"] .pg-title)
     {margin-bottom: 0;}
-[data-testid="stMetricValue"] {font-size: 1.35rem;}
-[data-testid="stMetricLabel"] p {font-size: .78rem;}
-/* 分段控件原生 32px,按钮/popover 40px,同排会高低不齐 → 统一到 40 */
-[data-testid="stButtonGroup"] [data-baseweb="button-group"],
-[data-testid="stButtonGroup"] [data-baseweb="button-group"] button {height: 40px;}
+
+/* ── 表格:核心密度 —— 13px、行高收紧、粘性表头 ── */
+[data-testid="stDataFrame"] {border: 1px solid var(--line); border-radius: 8px;
+                             background: var(--card);
+                             box-shadow: 0 1px 2px rgba(15,23,42,.04);}
+[data-testid="stDataFrame"] [role="columnheader"] {
+  font-size: 12px !important; font-weight: 700; color: var(--ink-sub);
+}
+[data-testid="stDataFrame"] [role="gridcell"] {font-size: 13px;}
+[data-testid="stMetricValue"] {font-size: 1.2rem; line-height: 1.5rem;}
+[data-testid="stMetricLabel"] p {font-size: 12px;}
+[data-testid="stMetric"] {background: var(--card); border: 1px solid var(--line);
+                          border-radius: 8px; padding: 8px 12px 6px;}
+
+/* 弹窗:白底 + 圆角 + 阴影(polabel2 §4 Modals);表单密度对齐主区 */
+[data-testid="stDialog"] {
+  background: rgba(0,0,0,.5); backdrop-filter: blur(2px);
+}
+[data-testid="stDialog"] [role="dialog"] {
+  border-radius: 12px; box-shadow: 0 25px 50px -12px rgba(0,0,0,.25);
+}
+/* 头部:默认 72px 高、标题 24px,压到 52px/16px(与页面标题同阶) */
+[data-testid="stDialog"] [role="dialog"] > div:first-child {
+  min-height: 0; padding: 14px 20px 10px;
+}
+[data-testid="stDialog"] [role="dialog"] > div:first-child p {
+  font-size: 16px; font-weight: 700; color: var(--ink); letter-spacing: -.01em;
+}
+/* 表单区:左右 padding 与头部一致,行距 16px → 10px */
+[data-testid="stDialog"] [role="dialog"] > div:nth-child(2) {
+  padding: 2px 20px 18px;
+}
+[data-testid="stDialog"] [data-testid="stVerticalBlock"] {gap: .625rem;}
+/* 表单 label:polabel2 §3 13px/600 */
+[data-testid="stDialog"] [data-testid="stWidgetLabel"] p {
+  font-size: 13px; font-weight: 600; color: #344054; margin-bottom: 0;
+}
+/* 弹窗内说明文字与下方控件留出呼吸感 */
+[data-testid="stDialog"] [data-testid="stCaptionContainer"] {margin-bottom: .2rem;}
+
+/* 输入卡:白卡 + 描边 + 浅阴影 */
+[data-testid="stVerticalBlockBorderWrapper"] {
+  background: var(--card); border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15,23,42,.04);
+}
 </style>""", unsafe_allow_html=True)
 
 # 状态元数据:表格文案 / 徽标配色 / 汇总顺序共用一份,避免各处硬编码分叉
@@ -439,10 +568,10 @@ def _delete_mock_rows():
 
 
 def load_all_mock():
-    """载入全站演示数据:结果视图(含截图) + 历史视图长列表 + 页面跟踪。"""
+    """载入全站演示数据:结果视图(含截图) + 历史视图长列表 + 链接监控。"""
     load_mock_results()
     load_mock_history()
-    load_mock_tracking()
+    monitor_demo.seed_demo(MONITOR_DB)
 
 
 def unload_all_mock():
@@ -451,112 +580,7 @@ def unload_all_mock():
     st.session_state["tracking"] = []
     st.session_state.pop("prev", None)
     _delete_mock_rows()
-    _delete_mock_tracking()
-
-
-# ---------- 页面/产品链接跟踪演示数据 ----------
-
-# 跟踪视图示例:覆盖 5 种状态、6 个站点,带上一条对比(状态/价格变化)
-# 字段 = 产品页快照:标题、价格、评分、评价数、上下架;checked_at 为最近一次快照
-MOCK_TRACKING = [
-    {
-        "asin": "B0TRACK0001", "domain": "amazon.com", "status": "alive",
-        "title": "Wireless Earbuds with Charging Case",
-        "price": "$29.99", "rating": "4.4", "review_count": "12,847",
-        "availability": "In Stock", "note": "", "checked_at": "2026-08-22 03:00:00",
-        "url": "https://www.amazon.com/dp/B0TRACK0001/",
-        "prev_status": "alive", "prev_price": "$32.99", "prev_time": "2026-08-21 03:00:00",
-    },
-    {
-        "asin": "B0TRACK0002", "domain": "amazon.in", "status": "alive",
-        "title": "Stainless Steel Water Bottle 1L",
-        "price": "₹799", "rating": "4.2", "review_count": "3,412",
-        "availability": "In Stock", "note": "价格较上次下调", "checked_at": "2026-08-22 02:30:00",
-        "url": "https://www.amazon.in/dp/B0TRACK0002/",
-        "prev_status": "alive", "prev_price": "₹849", "prev_time": "2026-08-21 02:30:00",
-    },
-    {
-        "asin": "B0TRACK0003", "domain": "amazon.com.au", "status": "deleted",
-        "title": "Portable Blender Juicer Cup",
-        "price": "", "rating": "", "review_count": "", "availability": "",
-        "note": "现评已删·HTTP 404 · Page Not Found", "checked_at": "2026-08-22 02:00:00",
-        "url": "https://www.amazon.com.au/dp/B0TRACK0003/",
-        "prev_status": "alive", "prev_price": "A$39.00", "prev_time": "2026-08-21 02:00:00",
-    },
-    {
-        "asin": "B0TRACK0004", "domain": "amazon.co.jp", "status": "blocked",
-        "title": "LED Desk Lamp with USB Port",
-        "price": "", "rating": "", "review_count": "", "availability": "",
-        "note": "重试 3 次仍被拦截(guard/captcha 拦截),建议稍后复测", "checked_at": "2026-08-22 01:30:00",
-        "url": "https://www.amazon.co.jp/dp/B0TRACK0004/",
-        "prev_status": "alive", "prev_price": "¥2,980", "prev_time": "2026-08-21 01:30:00",
-    },
-    {
-        "asin": "B0TRACK0005", "domain": "amazon.com.mx", "status": "login_expired",
-        "title": "Soporte para Laptop de Aluminio",
-        "price": "", "rating": "", "review_count": "", "availability": "",
-        "note": "跳转登录页,需重新引导登录该站点 Amazon 账号", "checked_at": "2026-08-22 01:00:00",
-        "url": "https://www.amazon.com.mx/dp/B0TRACK0005/",
-        "prev_status": "alive", "prev_price": "MX$599", "prev_time": "2026-08-21 01:00:00",
-    },
-    {
-        "asin": "B0TRACK0006", "domain": "amazon.com.br", "status": "alive",
-        "title": "Fone de Ouvido Bluetooth TWS",
-        "price": "R$89,90", "rating": "4.6", "review_count": "5,203",
-        "availability": "In Stock", "note": "", "checked_at": "2026-08-22 00:30:00",
-        "url": "https://www.amazon.com.br/dp/B0TRACK0006/",
-        "prev_status": "alive", "prev_price": "R$89,90", "prev_time": "2026-08-21 00:30:00",
-    },
-]
-
-
-def load_mock_tracking():
-    """载入演示跟踪数据:先清理本批演示记录再写入,保证幂等(不重复堆叠)。
-
-    与 load_mock_history 同款处理:tracking 表无唯一约束,直接 INSERT OR REPLACE
-    只会反复追加,点多次"载入演示数据"会把同一批 mock 记录存成多份。
-    """
-    ids = [t["asin"] for t in MOCK_TRACKING]
-    with _db() as conn:
-        conn.executemany("DELETE FROM tracking WHERE asin = ?",
-                         [(i,) for i in ids])
-        conn.executemany(
-            """INSERT INTO tracking
-               (asin, domain, url, status, title, price, rating, review_count,
-                availability, note, checked_at, prev_status, prev_price, prev_time)
-               VALUES (:asin, :domain, :url, :status, :title, :price, :rating,
-                       :review_count, :availability, :note, :checked_at,
-                       :prev_status, :prev_price, :prev_time)""",
-            MOCK_TRACKING,
-        )
-    st.session_state["tracking"] = list(MOCK_TRACKING)
-
-
-MOCK_TRACKING_IDS = tuple(t["asin"] for t in MOCK_TRACKING)
-
-
-def _delete_mock_tracking():
-    with _db() as conn:
-        conn.executemany("DELETE FROM tracking WHERE asin = ?",
-                         [(i,) for i in MOCK_TRACKING_IDS])
-
-
-def recent_tracking(limit: int = 200):
-    """最近跟踪的页面/产品快照(页面链接跟踪视图用)。
-
-    返回字段与 MOCK_TRACKING 对齐(含 url/prev_*),渲染层统一按 dict 取值;
-    若执行为裸元组,页面会在 r["status"] 处抛 tuple indices 错误。
-    """
-    if not DB.exists():
-        return []
-    cols = ("asin", "domain", "url", "status", "title", "price", "rating",
-            "review_count", "availability", "note", "checked_at",
-            "prev_status", "prev_price", "prev_time")
-    with _db() as conn:
-        conn.row_factory = sqlite3.Row
-        return [dict(row) for row in conn.execute(
-            "SELECT * FROM tracking ORDER BY checked_at DESC LIMIT ?",
-            (limit,)).fetchall()]
+    monitor_store.delete_by_asins(MONITOR_DB, list(monitor_demo.TIMELINES))
 
 
 init_db()
@@ -698,6 +722,7 @@ def system_dialog():
         st.caption(f"数据库: {info[0]:.1f} KB · {info[1]} 条记录")
     st.caption("升级 = 更新 pip 包 + 下载匹配的 Chromium,几分钟;完成后点下方按钮重启生效"
                "(也可宝塔项目管理器重启 / 本地 Ctrl-C 后重新 streamlit run)")
+    st.markdown('<div style="height:2px"></div>', unsafe_allow_html=True)
 
     if st.button("升级 Playwright", type="primary", use_container_width=True):
         py = _interp()
@@ -761,7 +786,7 @@ DOMAIN_ORDER = ["amazon.in", "amazon.com", "amazon.com.au",
                 "amazon.co.jp", "amazon.com.br", "amazon.com.mx"]
 
 
-@st.dialog("Amazon 账号登录管理", width="medium")
+@st.dialog("Amazon 账号登录管理", width="small")
 def login_dialog():
     gate = _panel_password()
     if gate and not st.session_state.get("lg_unlocked"):
@@ -895,20 +920,13 @@ def page_history():
     render_history()
 
 
-def page_link_tracking():
-    """页面链接跟踪:取数后交给独立视图模块渲染(筛选/搜索在 tracking_ui 内)。"""
-    rows = st.session_state.get("tracking")
-    if not rows:
-        rows = recent_tracking(200)
-    if not rows:
-        st.info("暂无跟踪数据。载入演示数据或完成一次产品页检测后会显示快照。",
-                icon=":material/track_changes:")
+def page_monitor():
+    """链接监控:数据独立于 history.db,交给 monitor.board 渲染成统一表格。"""
+    if not MONITOR_DB.exists() or monitor_store.count_snapshots(MONITOR_DB) == 0:
+        st.info("暂无监控数据。载入演示数据,或跑一轮采集后显示。",
+                icon=":material/monitoring:")
         return
-    tracking_ui.render(rows)
-
-
-def render_tracking():
-    page_link_tracking()
+    monitor_board.render(MONITOR_DB)
 
 
 MAX_BATCH = 50  # 批量边界:限速 3~5s/条,50 条约 4 分钟,更多请分批防 IP 过热
@@ -1123,9 +1141,9 @@ def render_results():
     } for r in shown]
 
     picked = st.dataframe(
-        table, use_container_width=True, hide_index=True, row_height=34,
+        table, use_container_width=True, hide_index=True, row_height=30,
         # 行少时按内容收紧,行多时给大屏一个高值填满视口(dataframe 不支持 stretch)
-        height=min(1000, 44 + 34 * len(table)),
+        height=min(1000, 40 + 30 * len(table)),
         key="res_table", on_select="rerun", selection_mode="single-row",
         column_config={
             # 12 列要在一屏内不横向截断:仅标题给 medium,其余压到 small
@@ -1209,9 +1227,9 @@ def render_history():
           "标题": r[3] or "—",
           "原页面": f"https://www.{r[1]}/gp/customer-reviews/{r[0]}/"}
          for r in rows],
-        use_container_width=True, hide_index=True, row_height=34,
+        use_container_width=True, hide_index=True, row_height=30,
         # 行少时按内容收紧,行多时给大屏一个高值填满视口(dataframe 不支持 stretch)
-        height=min(1000, 44 + 34 * len(rows)),
+        height=min(1000, 40 + 30 * len(rows)),
         column_config={
             "检测时间": st.column_config.TextColumn(width="small", pinned=True),
             # 主键要能整串核对,不能截断 → medium(已 pinned,横滚时仍可见)
@@ -1272,12 +1290,21 @@ def heat_dialog():
 NAV_PAGES = {
     "评价链接检测": ":material/fact_check:",
     "检测历史": ":material/history:",
-    "页面链接跟踪": ":material/track_changes:",
+    "链接监控": ":material/monitoring:",
 }
 
 with st.sidebar:
-    st.markdown("#### AmReview")
-    st.caption("Amazon 评价链接批量检测")
+    # 品牌行:蓝色方块标 + 名称,替代默认 h4(对齐 polabel2 侧边栏头部)
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:9px;padding:2px 2px 0;">'
+        '<div style="width:30px;height:30px;border-radius:7px;background:var(--pri);'
+        'color:#fff;font-weight:800;font-size:15px;display:flex;align-items:center;'
+        'justify-content:center;flex:none;">A</div>'
+        '<div><div style="font-size:14.5px;font-weight:700;color:var(--ink);'
+        'line-height:1.2;">AmReview</div>'
+        '<div style="font-size:11px;color:var(--ink-sub);line-height:1.3;">'
+        'Amazon 评价链接批量检测</div></div></div>',
+        unsafe_allow_html=True)
 
     # 页面切换:radio 保持在同一 session 内切换,输入与检测结果不丢失
     # (st.navigation 会整页重载并重置 session_state,实测不可用)
@@ -1324,4 +1351,4 @@ if page == "评价链接检测":
 elif page == "检测历史":
     page_history()
 else:
-    page_link_tracking()
+    page_monitor()
