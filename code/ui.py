@@ -806,9 +806,8 @@ def page_monitor():
             return
 
         from monitor import board as monitor_board
-        data = monitor_board.get_board_data(MONITOR_DB)
 
-        # 页头一行:左「标题+副行摘要」,右「操作+站点筛选+搜索」
+        # 页头一行:左「标题+副行摘要」,右「操作+搜索」
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
             with ui.row().classes("items-center gap-3"):
                 html('<div class="pg-title">链接监控</div>')
@@ -820,27 +819,55 @@ def page_monitor():
                 ui.button("添加监控", icon="add_link",
                           on_click=lambda: add_monitor_dialog(refresh)) \
                     .props("unelevated no-caps dense color=primary")
-                doms = data["domains"]
-                # 值"全部站点"已自说明,不挂 label(outlined label 必悬浮在框沿,显得挤)
-                sel = ui.select({**{"全部站点": "全部站点"},
-                                 **{d: d for d in doms}}, value="全部站点") \
-                    .props("outlined dense hide-bottom-space") \
-                    .classes("w-36")
                 q = ui.input(placeholder="搜索标题 / ASIN / URL …") \
                     .props("outlined dense hide-bottom-space") \
                     .classes("w-64").style("font-size:13px")
 
+        # 国家切卡:全部 + IN/AU/US/JP/MX/BR,点某国只看该国,再点恢复全部
+        cur = {"cc": "全部"}
+        card_holder = ui.row().classes("w-full items-center gap-2 mb-2")
         grid_holder = ui.column().classes("w-full")
+        CC_ORDER = ["全部", "IN", "AU", "US", "JP", "MX", "BR"]
+
+        def pick(cc):
+            # 点已选中的卡恢复全部;换卡直接切换
+            cur["cc"] = "全部" if cur["cc"] == cc else cc
+            rebuild()
 
         def rebuild():
             from monitor.board import _table_row  # 复用行构造(含上次对比+异常徽标)
-            # 每次都重取:跑完一轮采集 / 弹窗确认基线后,摘要与表格都是最新
+            # 每次都重取:跑完一轮采集 / 添加链接 / 确认基线后,卡片与表格都是最新
             data_now = monitor_board.get_board_data(MONITOR_DB)
+            counts = {}
+            for domain in (k[1] for k in data_now["latest"]):
+                cc = DOMAIN_SHORT(domain)
+                counts[cc] = counts.get(cc, 0) + 1
+            card_holder.clear()
+            with card_holder:
+                order = CC_ORDER + [c for c in sorted(counts) if c not in CC_ORDER]
+                for cc in order:
+                    if cc != "全部" and counts.get(cc, 0) == 0:
+                        continue  # 没有链接的国家不显示卡片
+                    active = cur["cc"] == cc
+                    bg = "#eff6ff" if active else "#fff"
+                    bd = "#2563eb" if active else "#e2e8f0"
+                    num_color = "#2563eb" if active else "#1e293b"
+                    num = data_now["total"] if cc == "全部" else counts.get(cc, 0)
+                    b = ui.button(on_click=lambda e, k=cc: pick(k)) \
+                        .props("flat no-caps dense")
+                    b.style(f"background:{bg};border:1px solid {bd};border-radius:6px;"
+                            "padding:4px 12px;min-height:0;height:32px;cursor:pointer;"
+                            "box-shadow:none;")
+                    with b:
+                        html(f'<span class="kpi-num" style="color:{num_color}">'
+                             f'{num}</span>'
+                             f'<span class="kpi-tag">{cc}</span>')
+
             anom_by_key = {(a["anomaly"]["asin"], a["anomaly"]["domain"]): a["anomaly"]
                            for a in data_now["anomalies"]}
             rows = []
             for (asin, domain), snap in data_now["latest"].items():
-                if sel.value != "全部站点" and DOMAIN_SHORT(domain) != sel.value:
+                if cur["cc"] != "全部" and DOMAIN_SHORT(domain) != cur["cc"]:
                     continue
                 row = _table_row(MONITOR_DB, asin, domain, snap, anom_by_key)
                 if q.value and q.value.lower() not in json.dumps(
@@ -877,7 +904,7 @@ def page_monitor():
                                      if badge != "正常" else
                                      '<span style="color:#15803d;font-weight:600">正常</span>'),
                     "status_html": status_text(zh_to_key.get(r["状态"], "unknown")),
-                    "asin": r["ASIN"], "domain": r["站点"], "title": r["标题"],
+                    "asin": r["ASIN"], "title": r["标题"],
                     "price": r["价格"], "rating": r["评分"], "rc": r["评价数"],
                     "buybox": r["BuyBox"], "avail": r["上下架"], "last": r["上次"],
                     "ts": r["跟踪时间"], "_asin": r["_asin"], "_domain": r["_domain"],
@@ -887,7 +914,6 @@ def page_monitor():
                     {"headerName": "状态", "field": "status_html", "width": 80, "pinned": "left"},
                     {"headerName": "ASIN", "field": "asin", "width": 110, "pinned": "left"},
                     {"headerName": "异常", "field": "anomaly_html", "width": 110},
-                    {"headerName": "站点", "field": "domain", "width": 72},
                     {"headerName": "标题", "field": "title", "minWidth": 180, "flex": 3},
                     {"headerName": "价格", "field": "price", "width": 90},
                     {"headerName": "评分", "field": "rating", "width": 64},
@@ -904,7 +930,6 @@ def page_monitor():
             g.on("cellClicked", lambda e: history_dialog(
                 MONITOR_DB, e.args["data"]["_asin"], e.args["data"]["_domain"]))
 
-        sel.on_value_change(lambda e: rebuild())
         q.on("keydown", lambda e: rebuild() if e.args.get("key") == "Enter" else None)
         rebuild()
 
