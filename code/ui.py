@@ -16,6 +16,7 @@ import html as html_mod
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -70,6 +71,12 @@ ui.add_head_html("""<style>
 .copy-toast {position:fixed;top:18px;left:50%;transform:translateX(-50%);
   background:#1e293b;color:#fff;font-size:12px;padding:5px 12px;border-radius:6px;
   z-index:9999;opacity:0;transition:opacity .15s;pointer-events:none;}
+/* AG Grid v34 delay-render shim:列含 flex 时 AG Grid 会先隐藏表格、等
+   ResizeObserver 回调再显示,但该回调在本环境不触发,表格永久空白(实测)。
+   CSS 保底强制可见;下面的轮询在出现 250ms 后摘掉 ag-delay-render 类,
+   正常流程 AG Grid 自己会先摘,轮询只兜底卡死的场景。 */
+:where(.ag-delay-render) .ag-row, :where(.ag-delay-render) .ag-cell,
+:where(.ag-delay-render) .ag-header-cell {visibility:visible !important;}
 </style>""", shared=True)
 ui.add_body_html("""<script>
 function copyText(t) {
@@ -90,6 +97,12 @@ function showCopyToast(msg) {
   setTimeout(function() { el.style.opacity = '0'; }, 1200);
   setTimeout(function() { el.remove(); }, 1500);
 }
+(function pollDelayRender() {
+  document.querySelectorAll('.ag-delay-render').forEach(function(el) {
+    setTimeout(function() { el.classList.remove('ag-delay-render'); }, 250);
+  });
+  setTimeout(pollDelayRender, 500);
+})();
 </script>""", shared=True)
 
 
@@ -160,7 +173,8 @@ def recent_history(limit=500, days=None):
         params = [f"-{days} days"]
     with _db() as conn:
         return conn.execute(
-            f"""SELECT review_id, domain, status, title, checked_at
+            f"""SELECT review_id, domain, url, status, stars, title,
+                author, review_date, note, checked_at
                 FROM history {where} ORDER BY checked_at DESC LIMIT ?""",
             params + [limit]).fetchall()
 
@@ -447,6 +461,14 @@ def pill(status: str):
             f'{label}</span>')
 
 
+def status_text(status: str) -> str:
+    """状态列(极简):纯文字 + 状态色,不要药丸底色。"""
+    label = STATUS_META.get(status, (status, ""))[0]
+    color = {"alive": "#15803d", "deleted": "#b91c1c", "blocked": "#b45309",
+             "login_expired": "#6d28d9"}.get(status, "#475569")
+    return f'<span style="color:{color};font-weight:600">{label}</span>'
+
+
 def stars_html(stars) -> str:
     """星级着色:4~5 星绿色(好评),1~3 星红色(差评),无星级灰色破折号。"""
     if not str(stars).isdigit():
@@ -596,7 +618,7 @@ def page_check():
             for r in shown:
                 p = prev.get(r["review_id"])
                 rows.append({
-                    "status_html": pill(r["status"]),
+                    "status_text": status_text(r["status"]),
                     "status_sort": r["status"],
                     "review_id": r["review_id"],
                     "link": link_cell(r["url"]),
@@ -614,7 +636,7 @@ def page_check():
                 })
             grid = ui.aggrid({
                 "columnDefs": [
-                    {"headerName": "状态", "field": "status_html", "width": 92,
+                    {"headerName": "状态", "field": "status_text", "width": 80,
                      "pinned": "left"},
                     {"headerName": "Review ID", "field": "review_id", "width": 148,
                      "pinned": "left"},
@@ -622,11 +644,11 @@ def page_check():
                     {"headerName": "站点", "field": "domain", "width": 62},
                     {"headerName": "星级", "field": "stars", "width": 62},
                     {"headerName": "VP", "field": "vp", "width": 56},
-                    {"headerName": "标题", "field": "title", "minWidth": 180},
+                    {"headerName": "标题", "field": "title", "minWidth": 160, "flex": 3},
                     {"headerName": "作者", "field": "author", "width": 92},
                     {"headerName": "评价日期", "field": "review_date", "width": 134},
                     {"headerName": "上次检测", "field": "last", "width": 200},
-                    {"headerName": "判定依据", "field": "note", "width": 220},
+                    {"headerName": "判定依据", "field": "note", "minWidth": 160, "flex": 2},
                     {"headerName": "检测时间", "field": "checked_at", "width": 104},
                 ],
                 "rowData": rows,
@@ -700,11 +722,16 @@ def page_history():
                     .props("outline no-caps dense")
 
         def h_row(r):
-            label, cls = STATUS_META.get(r[2], (r[2], ""))
+            rid, domain, url, status, stars, title, author, review_date, note, checked = r
             return {
-                "checked": r[4], "review_id": r[0], "domain": DOMAIN_SHORT(r[1]),
-                "link": link_cell(f"https://www.{r[1]}/gp/customer-reviews/{r[0]}/"),
-                "status_html": pill(r[2]), "title": r[3] or "—",
+                "checked": checked, "review_id": rid, "domain": DOMAIN_SHORT(domain),
+                "link": link_cell(url or f"https://www.{domain}/gp/customer-reviews/{rid}/"),
+                "status_text": status_text(status),
+                "stars": stars_html(stars),
+                "title": title or "—",
+                "author": author or "—",
+                "review_date": review_date or "—",
+                "note": note or "—",
             }
 
         def set_meta(n):
@@ -719,13 +746,17 @@ def page_history():
                 {"headerName": "Review ID", "field": "review_id", "width": 148, "pinned": "left"},
                 {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
                 {"headerName": "站点", "field": "domain", "width": 62},
-                {"headerName": "状态", "field": "status_html", "width": 86},
-                {"headerName": "标题", "field": "title", "minWidth": 220},
+                {"headerName": "状态", "field": "status_text", "width": 78},
+                {"headerName": "星级", "field": "stars", "width": 66},
+                {"headerName": "标题", "field": "title", "minWidth": 160, "flex": 3},
+                {"headerName": "作者", "field": "author", "width": 90},
+                {"headerName": "评价日期", "field": "review_date", "width": 130},
+                {"headerName": "判定依据", "field": "note", "minWidth": 160, "flex": 2},
             ],
             "rowData": [],
-            "defaultColDef": {"sortable": True},
+            "defaultColDef": {"sortable": True, "resizable": True},
             "rowHeight": 30,
-        }, html_columns=[2, 4]).classes("w-full ag-dense ag-fill")
+        }, html_columns=[2, 4, 5]).classes("w-full ag-dense ag-fill")
 
         def load_rows():
             data_rows = [h_row(r) for r in recent_history(500, days["kw"])]
@@ -757,21 +788,38 @@ def stats_dialog(days):
 @ui.page("/monitor")
 def page_monitor():
     with build_shell("/monitor"):
+
+        def refresh():
+            ui.navigate.to("/monitor")
+
+        # 空态:给真实入口(添加监控 / 演示数据),而不是一句干巴巴的提示
         if not MONITOR_DB.exists() or monitor_store.count_snapshots(MONITOR_DB) == 0:
             html('<div class="pg-title">链接监控</div>')
-            ui.label("暂无监控数据。侧边栏载入演示数据,或跑一轮采集后显示。") \
-                .classes("text-[13px] text-[#64748b]")
+            html('<div class="pg-meta">盯住产品页变化:价格 / 评分 / 评价数 / '
+                 '上下架。先添加要监控的链接,再跑一轮采集生成看板。</div>')
+            with ui.row().classes("mt-3 gap-2"):
+                ui.button("添加监控", icon="add_link",
+                          on_click=lambda: add_monitor_dialog(refresh)) \
+                    .props("unelevated no-caps color=primary")
+                ui.button("载入演示数据", icon="science", on_click=toggle_mock) \
+                    .props("outline no-caps")
             return
 
         from monitor import board as monitor_board
         data = monitor_board.get_board_data(MONITOR_DB)
 
-        # 页头一行:左「标题+副行摘要」,右「站点筛选+搜索」
+        # 页头一行:左「标题+副行摘要」,右「操作+站点筛选+搜索」
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
             with ui.row().classes("items-center gap-3"):
                 html('<div class="pg-title">链接监控</div>')
                 summary = html('')
             with ui.row().classes("items-center gap-2"):
+                ui.button("跑一轮采集", icon="play_arrow",
+                          on_click=lambda: run_monitor_round(refresh)) \
+                    .props("outline no-caps dense")
+                ui.button("添加监控", icon="add_link",
+                          on_click=lambda: add_monitor_dialog(refresh)) \
+                    .props("unelevated no-caps dense color=primary")
                 doms = data["domains"]
                 # 值"全部站点"已自说明,不挂 label(outlined label 必悬浮在框沿,显得挤)
                 sel = ui.select({**{"全部站点": "全部站点"},
@@ -786,10 +834,12 @@ def page_monitor():
 
         def rebuild():
             from monitor.board import _table_row  # 复用行构造(含上次对比+异常徽标)
+            # 每次都重取:跑完一轮采集 / 弹窗确认基线后,摘要与表格都是最新
+            data_now = monitor_board.get_board_data(MONITOR_DB)
             anom_by_key = {(a["anomaly"]["asin"], a["anomaly"]["domain"]): a["anomaly"]
-                           for a in data["anomalies"]}
+                           for a in data_now["anomalies"]}
             rows = []
-            for (asin, domain), snap in data["latest"].items():
+            for (asin, domain), snap in data_now["latest"].items():
                 if sel.value != "全部站点" and DOMAIN_SHORT(domain) != sel.value:
                     continue
                 row = _table_row(MONITOR_DB, asin, domain, snap, anom_by_key)
@@ -798,10 +848,9 @@ def page_monitor():
                     continue
                 rows.append(row)
             rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
-            abnormal = sum(1 for r in rows if r["_sev"] < 9)
             summary.set_content(
-                f'<div class="pg-meta">监控 {data["total"]} 条 · 异常 '
-                f'{data["abnormal_count"]} 条 · 当前显示 {len(rows)} 条</div>')
+                f'<div class="pg-meta">监控 {data_now["total"]} 条 · 异常 '
+                f'{data_now["abnormal_count"]} 条 · 当前显示 {len(rows)} 条</div>')
             grid_holder.clear()
             with grid_holder:
                 make_grid(rows)
@@ -826,8 +875,8 @@ def page_monitor():
                 g_rows.append({
                     "anomaly_html": (f'<span class="pill {cls}">{badge}</span>'
                                      if badge != "正常" else
-                                     '<span class="pill bg-[#dcfce7] text-[#15803d]">正常</span>'),
-                    "status_html": pill(zh_to_key.get(r["状态"], "unknown")),
+                                     '<span style="color:#15803d;font-weight:600">正常</span>'),
+                    "status_html": status_text(zh_to_key.get(r["状态"], "unknown")),
                     "asin": r["ASIN"], "domain": r["站点"], "title": r["标题"],
                     "price": r["价格"], "rating": r["评分"], "rc": r["评价数"],
                     "buybox": r["BuyBox"], "avail": r["上下架"], "last": r["上次"],
@@ -835,21 +884,21 @@ def page_monitor():
                 })
             g = ui.aggrid({
                 "columnDefs": [
-                    {"headerName": "状态", "field": "status_html", "width": 88, "pinned": "left"},
+                    {"headerName": "状态", "field": "status_html", "width": 80, "pinned": "left"},
                     {"headerName": "ASIN", "field": "asin", "width": 110, "pinned": "left"},
                     {"headerName": "异常", "field": "anomaly_html", "width": 110},
                     {"headerName": "站点", "field": "domain", "width": 72},
-                    {"headerName": "标题", "field": "title", "minWidth": 200},
+                    {"headerName": "标题", "field": "title", "minWidth": 180, "flex": 3},
                     {"headerName": "价格", "field": "price", "width": 90},
                     {"headerName": "评分", "field": "rating", "width": 64},
                     {"headerName": "评价数", "field": "rc", "width": 72},
                     {"headerName": "BuyBox", "field": "buybox", "width": 100},
                     {"headerName": "上下架", "field": "avail", "width": 90},
-                    {"headerName": "上次", "field": "last", "width": 140},
+                    {"headerName": "上次", "field": "last", "minWidth": 120, "flex": 2},
                     {"headerName": "跟踪时间", "field": "ts", "width": 96},
                 ],
                 "rowData": g_rows,
-                "defaultColDef": {"sortable": True},
+                "defaultColDef": {"sortable": True, "resizable": True},
                 "rowHeight": 30,
             }, html_columns=[0, 2]).classes("w-full ag-dense ag-fill")
             g.on("cellClicked", lambda e: history_dialog(
@@ -858,6 +907,101 @@ def page_monitor():
         sel.on_value_change(lambda e: rebuild())
         q.on("keydown", lambda e: rebuild() if e.args.get("key") == "Enter" else None)
         rebuild()
+
+
+def add_monitor_dialog(on_done):
+    """添加监控弹窗:粘贴 Amazon 商品页链接(或手填 ASIN),入库 profiles。"""
+    with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">添加监控链接</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        html('<div class="pg-meta">粘贴 Amazon 商品页链接(自动识别 ASIN 与站点)'
+             ',可一次多行批量添加</div>')
+        ta = ui.textarea(placeholder="https://www.amazon.com/dp/B0XXXXXXXX/\n"
+                                     "https://www.amazon.in/dp/B0YYYYYYYY/")
+        ta.classes("w-full").props("outlined dense rows=5").style("font-size:13px")
+        msg = ui.label("").classes("pg-meta")
+
+        def _add():
+            text = ta.value or ""
+            found, errs = [], []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r"amazon\.([a-z.]+)/dp/([A-Z0-9]{10})", line, re.I) \
+                    or re.search(r"amazon\.([a-z.]+)/gp/product/([A-Z0-9]{10})", line, re.I)
+                if m:
+                    found.append((m.group(2).upper(), f"amazon.{m.group(1).lower()}", line))
+                else:
+                    errs.append(line)
+            if not found:
+                msg.set_text("未解析到有效商品链接(/dp/ASIN 格式)")
+                return
+            from monitor import store as ms
+            from monitor.pipeline import add_profile
+            added = skipped = 0
+            for asin, domain, url in found:
+                if ms.get_profile(MONITOR_DB, asin, domain):
+                    skipped += 1          # 已在监控中,不覆盖其配置
+                    continue
+                add_profile(MONITOR_DB, asin=asin, domain=domain, url=url)
+                added += 1
+            d.close()
+            ui.notify(f"已添加 {added} 条监控" +
+                      (f",跳过已存在 {skipped} 条" if skipped else ""),
+                      type="positive")
+            on_done()
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("取消", on_click=d.close).props("outline no-caps dense")
+            ui.button("添加", on_click=_add).props("unelevated no-caps dense color=primary")
+    d.open()
+
+
+def run_monitor_round(on_done):
+    """跑一轮采集:真实抓取 profiles 里启用的 ASIN,进度与结果用通知反馈。"""
+    from monitor import store as ms
+    from monitor.pipeline import run_round
+    from monitor.address import PlaywrightAdapter
+
+    profs = ms.list_profiles(MONITOR_DB)
+    if not profs:
+        ui.notify("还没有监控链接,先点「添加监控」", type="warning")
+        return
+
+    async def _run():
+        domains = sorted({p["domain"] for p in profs})
+        notify = ui.notify(f"开始采集:{len(profs)} 条链接、{len(domains)} 个站点…",
+                           type="ongoing", timeout=None)
+
+        def _work():
+            results = {}
+            for dom in domains:
+                dom_profs = [p for p in profs if p["domain"] == dom
+                             and p.get("monitor_enabled", 1)]
+                if not dom_profs:
+                    continue
+                adapter = PlaywrightAdapter(dom)
+                try:
+                    results[dom] = run_round(MONITOR_DB, adapter, profiles=dom_profs)
+                finally:
+                    adapter.close()
+            return results
+
+        try:
+            res = await run.io_bound(_work)
+            checked = sum(r["checked"] for r in res.values())
+            anomalies = sum(r["anomalies"] for r in res.values())
+            notify.dismiss()
+            ui.notify(f"采集完成:{checked} 条,发现异常 {anomalies} 条",
+                      type="warning" if anomalies else "positive")
+        except Exception as e:
+            notify.dismiss()
+            ui.notify(f"采集失败:{e.__class__.__name__}: {e}", type="negative")
+        on_done()
+
+    _run()
 
 
 def history_dialog(db_path, asin, domain):
