@@ -1,10 +1,8 @@
 # 推送 main 后自动部署到宝塔服务器
-# 前置:在仓库 Settings → Secrets and variables → Actions 配置:
-#   SSH_HOST         服务器 IP
-#   SSH_USER         登录用户(宝塔一般 root)
-#   SSH_PORT         SSH 端口(默认 22)
-#   SSH_PRIVATE_KEY  服务器登录私钥(ed25519 完整内容)
-#   DEPLOY_PATH      宝塔站点目录,示例: /www/wwwroot/amcheck.usfan.net (该目录内直接是 app.py)
+# 机制:服务器端宝塔 WebHook 插件收到触发后执行
+#       /www/server/panel/plugin/webhook/script/<access_key>
+#       → bash /www/wwwroot/amcheck_git/deploy.sh(git fetch → reset → pip → 重启 → 健康检查)
+# 前置:仓库 Secret BT_WEBHOOK_URL = 宝塔 WebHook 完整 URL(含 access_key)
 # 访问入口: https://amcheck.usfan.net → Nginx 反代到 127.0.0.1:8765
 
 name: 部署到宝塔
@@ -19,59 +17,13 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: rsync 同步 code/ 到服务器
+      - name: 触发宝塔 WebHook(git 拉取 + 重启 + 健康检查)
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PORT: ${{ secrets.SSH_PORT }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          WEBHOOK_URL: ${{ secrets.BT_WEBHOOK_URL }}
         run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          # 排除运行时数据与敏感文件;exclude 的文件在 --delete 下也受保护,不会被删
-          # (登录态在服务器 ~/.amreview/,不在站点目录内,rsync 本就碰不到)
-          rsync -avz --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p $SSH_PORT -o StrictHostKeyChecking=no" \
-            --exclude '.venv' \
-            --exclude '__pycache__' \
-            --exclude '*.pyc' \
-            --exclude 'history.db' \
-            --exclude 'monitor.db' \
-            --exclude 'screenshots/' \
-            --exclude 'accounts.json' \
-            --exclude 'graphify-out' \
-            --exclude '.nicegui' \
-            --exclude '.streamlit' \
-            --exclude '.DS_Store' \
-            code/ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
-
-      - name: 重启服务
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            set -e
-            cd ${{ secrets.DEPLOY_PATH }}
-            # 杀掉旧进程(NiceGUI 版 ui.py;保留 streamlit 行以防回退旧版入口)
-            # 宝塔 Python 管理器守护会自动拉起
-            # (若用 pm2 管理,把这行改为: pm2 restart amcheck)
-            pkill -f "python ui.py" || true
-            pkill -f "streamlit run app.py" || true
-            sleep 2
-            # 确认端口监听(守护拉起需要几秒,最多等 20 秒)
-            for i in $(seq 1 10); do
-              if curl -fs -o /dev/null --max-time 2 http://127.0.0.1:8765/; then
-                echo "✅ 服务已恢复 (端口 8765)"
-                exit 0
-              fi
-              sleep 2
-            done
-            echo "⚠️ 端口 8765 未在 20 秒内恢复,请到宝塔面板检查项目状态" >&2
-            exit 1
+          set -euo pipefail
+          code=$(curl -sk -o /tmp/hook_resp.txt -w '%{http_code}' \
+            --max-time 120 "$WEBHOOK_URL&param=github-${GITHUB_SHA::7}")
+          echo "HTTP $code · 响应: $(cat /tmp/hook_resp.txt)"
+          # 宝塔 webhook 受理即回 {"code":1};部署结果以服务器 deploy.log 的 DEPLOY_OK 为准
+          [ "$code" = "200" ] || { echo "WebHook 触发失败" >&2; exit 1; }
