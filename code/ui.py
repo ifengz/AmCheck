@@ -1336,10 +1336,12 @@ def add_monitor_dialog(on_done):
                 line = line.strip()
                 if not line:
                     continue
-                m = re.search(r"amazon\.([a-z.]+)/dp/([A-Z0-9]{10})", line, re.I) \
-                    or re.search(r"amazon\.([a-z.]+)/gp/product/([A-Z0-9]{10})", line, re.I)
-                if m:
-                    found.append((m.group(2).upper(), f"amazon.{m.group(1).lower()}", line))
+                # 域名与 /dp/ 之间可能有标题 slug(如 /LUXTER-Cordless.../dp/ASIN),
+                # 所以域名和 ASIN 分别单独匹配,不要求相邻
+                dm = re.search(r"amazon\.([a-z.]+?)(?:/|$|[?#])", line, re.I)
+                am = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:\b|[/?#]|$)", line, re.I)
+                if dm and am:
+                    found.append((am.group(1).upper(), f"amazon.{dm.group(1).lower()}", line))
                 else:
                     errs.append(line)
             if not found:
