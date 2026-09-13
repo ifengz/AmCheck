@@ -710,9 +710,9 @@ def page_history():
     with build_shell("/history"):
         days = {"kw": 7}
 
-        # 页头一行:左「标题+副行(含计数)」,右「时间范围+统计」——紧凑不割裂
+        # 页头:左「标题+副行」上下两行,右「时间范围+统计」(与首页/监控页同版式)
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
-            with ui.row().classes("items-center gap-3"):
+            with ui.column().classes("gap-0"):
                 html('<div class="pg-title">评价链接检测历史</div>')
                 meta = html('')
             with ui.row().classes("items-center gap-2"):
@@ -1150,9 +1150,9 @@ def page_monitor():
         has_data = (MONITOR_DB.exists()
                     and monitor_store.count_snapshots(MONITOR_DB) > 0)
 
-        # 页头一行:左「标题+副行摘要」,右「操作+搜索」
+        # 页头:左「标题+副行摘要」上下两行,右「操作+搜索」(与首页/历史页同版式)
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
-            with ui.row().classes("items-center gap-3"):
+            with ui.column().classes("gap-0"):
                 html('<div class="pg-title">链接监控</div>')
                 summary = html('')
             with ui.row().classes("items-center gap-2"):
