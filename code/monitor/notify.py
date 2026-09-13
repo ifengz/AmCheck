@@ -32,24 +32,64 @@ def _sign(secret: str, ts_ms: int) -> str:
 
 
 def get_config(db_path) -> dict:
-    """读通知配置:DB 优先,环境变量兜底;AMCHECK_NOTIFY_DISABLE=1 全局静音。"""
+    """读通知配置:DB 优先,环境变量兜底;AMCHECK_NOTIFY_DISABLE=1 全局静音。
+
+    mode="group" 用群机器人 webhook;mode="app" 用企业内部应用机器人单聊。
+    """
     if os.environ.get("AMCHECK_NOTIFY_DISABLE") == "1":
-        return {"webhook": "", "secret": "", "mute_h": 12.0}
+        return {"mode": "", "webhook": "", "secret": "", "mute_h": 12.0,
+                "client_id": "", "client_secret": "", "robot_code": "",
+                "user_ids": []}
+    mode = store.get_setting(db_path, "notify_mode", "group") or "group"
     url = store.get_setting(db_path, "notify_webhook") or \
         os.environ.get("AMCHECK_NOTIFY_WEBHOOK", "")
     secret = store.get_setting(db_path, "notify_secret") or \
         os.environ.get("AMCHECK_NOTIFY_SECRET", "")
+    client_id = store.get_setting(db_path, "notify_client_id") or \
+        os.environ.get("AMCHECK_DING_CLIENT_ID", "")
+    client_secret = store.get_setting(db_path, "notify_client_secret") or \
+        os.environ.get("AMCHECK_DING_CLIENT_SECRET", "")
+    robot_code = store.get_setting(db_path, "notify_robot_code") or client_id
+    raw_ids = store.get_setting(db_path, "notify_user_ids") or \
+        os.environ.get("AMCHECK_DING_USER_IDS", "")
+    user_ids = [x.strip() for x in raw_ids.replace("，", ",").split(",")
+                if x.strip()]
     try:
         mute = float(store.get_setting(db_path, "notify_mute_h") or
                      os.environ.get("AMCHECK_NOTIFY_UPTIME_H", "12") or 12)
     except ValueError:
         mute = 12.0
-    return {"webhook": url.strip(), "secret": secret.strip(), "mute_h": mute}
+    return {"mode": mode.strip(),
+            "webhook": url.strip(), "secret": secret.strip(), "mute_h": mute,
+            "client_id": client_id.strip(), "client_secret": client_secret.strip(),
+            "robot_code": robot_code.strip(), "user_ids": user_ids}
 
 
-def push_text(db_path, text: str) -> tuple[bool, str]:
-    """推一条文本到钉钉机器人。返回 (成功?, 说明)。未配置返回 (False, 原因)。"""
-    cfg = get_config(db_path)
+_TOKEN_CACHE = {"token": "", "exp": 0.0}
+
+
+def _access_token(client_id: str, client_secret: str) -> str:
+    """企业内部应用 accessToken,缓存到过期前 5 分钟。"""
+    now = time.time()
+    if _TOKEN_CACHE["token"] and _TOKEN_CACHE["exp"] > now:
+        return _TOKEN_CACHE["token"]
+    body = json.dumps({"appKey": client_id,
+                       "appSecret": client_secret}).encode()
+    req = urllib.request.Request(
+        "https://api.dingtalk.com/v1.0/oauth2/accessToken", data=body,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        d = json.loads(r.read())
+    tok = d.get("accessToken", "")
+    if not tok:
+        raise RuntimeError(str(d)[:120])
+    expire = int(d.get("expireIn", 7200) or 7200)
+    _TOKEN_CACHE.update(token=tok, exp=now + max(expire - 300, 60))
+    return tok
+
+
+def _push_webhook(cfg: dict, text: str) -> tuple[bool, str]:
+    """群机器人 webhook(自定义机器人,支持钉钉/企微加签)。"""
     url = cfg["webhook"]
     if not url:
         return False, "未配置 webhook"
@@ -64,7 +104,6 @@ def push_text(db_path, text: str) -> tuple[bool, str]:
         with urllib.request.urlopen(req, timeout=10) as r:
             raw = r.read().decode(errors="replace")
         ok = r.status == 200
-        # 钉钉业务错误也回 200,看 errcode
         try:
             errcode = json.loads(raw).get("errcode", 0)
         except Exception:
@@ -74,6 +113,53 @@ def push_text(db_path, text: str) -> tuple[bool, str]:
         return False, f"机器人拒绝: {raw[:120]}"
     except Exception as e:
         return False, f"{e.__class__.__name__}: {e}"
+
+
+def _push_app(cfg: dict, text: str) -> tuple[bool, str]:
+    """企业内部应用机器人单聊推送,收件人取 cfg["user_ids"]。"""
+    if not cfg["client_id"] or not cfg["client_secret"]:
+        return False, "未配置应用 Client ID / Secret"
+    if not cfg["user_ids"]:
+        return False, "未配置收件人 userid"
+    try:
+        tok = _access_token(cfg["client_id"], cfg["client_secret"])
+    except Exception as e:
+        return False, f"取 accessToken 失败: {e.__class__.__name__}: {e}"
+    body = json.dumps({
+        "robotCode": cfg["robot_code"] or cfg["client_id"],
+        "userIds": cfg["user_ids"],
+        "msgKey": "sampleText",
+        "msgParam": json.dumps({"content": text}, ensure_ascii=False),
+    }, ensure_ascii=False).encode()
+    req = urllib.request.Request(
+        "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "x-acs-dingtalk-access-token": tok})
+    status = 0
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw, status = r.read().decode(errors="replace"), r.status
+    except Exception as e:
+        try:
+            raw, status = e.read().decode(errors="replace"), getattr(e, "code", 0)
+        except Exception:
+            return False, f"{e.__class__.__name__}: {e}"
+    try:
+        d = json.loads(raw)
+    except Exception:
+        d = {}
+    if status == 200 and not d.get("code"):
+        return True, "已推送"
+    return False, f"机器人拒绝: {raw[:140]}"
+
+
+def push_text(db_path, text: str) -> tuple[bool, str]:
+    """推一条文本;按配置选群机器人或企业应用。返回 (成功?, 说明)。"""
+    cfg = get_config(db_path)
+    if cfg["mode"] == "app":
+        return _push_app(cfg, text)
+    return _push_webhook(cfg, text)
 
 
 def _last_push(db_path, asin: str, domain: str, metric: str) -> float:
@@ -107,7 +193,12 @@ def notify_new_anomalies(db_path, round_anomaly_count: int,
     if not round_anomaly_count:
         return 0
     cfg = get_config(db_path)
-    if not cfg["webhook"]:
+    if cfg["mode"] == "app":
+        configured = bool(cfg["client_id"] and cfg["client_secret"]
+                          and cfg["user_ids"])
+    else:
+        configured = bool(cfg["webhook"])
+    if not configured:
         return 0
     import sqlite3
     with store._connect(db_path) as conn:

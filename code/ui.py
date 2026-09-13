@@ -1363,15 +1363,48 @@ def schedule_dialog():
              f'<br>仅采集真实链接(演示数据自动跳过),按站点并行无头浏览器。</div>')
 
         ui.separator()
-        # 钉钉通知
-        html('<div class="card-title" style="font-size:14px">钉钉机器人通知</div>')
-        wh = ui.input("Webhook 地址",
-                      value=sget(MONITOR_DB, "notify_webhook", cfg["webhook"]),
-                      placeholder="https://oapi.dingtalk.com/robot/send?access_token=***") \
-            .props("outlined dense").classes("w-full")
-        sec = ui.input("加签密钥(SEC 开头,未加签留空)",
-                       value=sget(MONITOR_DB, "notify_secret", cfg["secret"])) \
-            .props("outlined dense").classes("w-full")
+        # 钉钉通知:群机器人 webhook(简单) / 企业内部应用机器人单聊(私聊)
+        html('<div class="card-title" style="font-size:14px">钉钉通知</div>')
+        mode_sel = ui.radio({"group": "群机器人 Webhook", "app": "企业内部应用"},
+                            value=sget(MONITOR_DB, "notify_mode", "group")) \
+            .props("inline dense")
+
+        group_box = ui.column().classes("w-full gap-1")
+        with group_box:
+            wh = ui.input("Webhook 地址",
+                          value=sget(MONITOR_DB, "notify_webhook", cfg["webhook"]),
+                          placeholder="https://oapi.dingtalk.com/robot/send?access_token=***") \
+                .props("outlined dense").classes("w-full")
+            sec = ui.input("加签密钥(SEC 开头,未加签留空)",
+                           value=sget(MONITOR_DB, "notify_secret", cfg["secret"])) \
+                .props("outlined dense").classes("w-full")
+            html('<div class="pg-meta">钉钉群 → 群设置 → 智能群助手 → 添加机器人 → '
+                 '自定义,拿到 Webhook 粘这里。</div>')
+
+        app_box = ui.column().classes("w-full gap-1")
+        with app_box:
+            cid = ui.input("Client ID(AppKey)",
+                           value=sget(MONITOR_DB, "notify_client_id", "")) \
+                .props("outlined dense").classes("w-full")
+            csec = ui.input("Client Secret",
+                            value=sget(MONITOR_DB, "notify_client_secret", ""),
+                            password=True).props("outlined dense").classes("w-full")
+            rcode = ui.input("Robot Code(留空则同 Client ID)",
+                             value=sget(MONITOR_DB, "notify_robot_code", "")) \
+                .props("outlined dense").classes("w-full")
+            uids = ui.input("收件人 userid(多个逗号分隔)",
+                            value=sget(MONITOR_DB, "notify_user_ids", ""),
+                            placeholder="manager1234,user5678") \
+                .props("outlined dense").classes("w-full")
+            html('<div class="pg-meta">私聊推给指定人。userid 需在开放平台开通'
+                 '通讯录权限后才能查到(手机号换 userid 接口)。</div>')
+
+        def _sync_mode():
+            group_box.set_visibility(mode_sel.value == "group")
+            app_box.set_visibility(mode_sel.value == "app")
+        mode_sel.on_value_change(lambda e: _sync_mode())
+        _sync_mode()
+
         mute = ui.number("同一异常静默期(小时)",
                          value=float(sget(MONITOR_DB, "notify_mute_h", "12") or 12),
                          min=0, max=720, step=1) \
@@ -1382,8 +1415,13 @@ def schedule_dialog():
         def _save():
             sset(MONITOR_DB, "schedule_enabled", "1" if enabled.value else "0")
             sset(MONITOR_DB, "schedule_interval_h", str(interval.value or 6))
+            sset(MONITOR_DB, "notify_mode", mode_sel.value or "group")
             sset(MONITOR_DB, "notify_webhook", (wh.value or "").strip())
             sset(MONITOR_DB, "notify_secret", (sec.value or "").strip())
+            sset(MONITOR_DB, "notify_client_id", (cid.value or "").strip())
+            sset(MONITOR_DB, "notify_client_secret", (csec.value or "").strip())
+            sset(MONITOR_DB, "notify_robot_code", (rcode.value or "").strip())
+            sset(MONITOR_DB, "notify_user_ids", (uids.value or "").strip())
             sset(MONITOR_DB, "notify_mute_h", str(mute.value or 12))
             ui.notify("已保存,定时采集按新配置运行", type="positive")
             d.close()
