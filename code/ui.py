@@ -55,7 +55,8 @@ STATUS_META = {  # status -> (中文, tailwind 药丸 class)
     "login_expired": ("登录失效", "bg-[#ede9fe] text-[#6d28d9]"),
     "unknown": ("未知", "bg-[#e2e8f0] text-[#475569]"),
 }
-STATUS_ORDER = ["alive", "deleted", "blocked", "login_expired", "unknown"]
+# 站点内展示顺序:问题状态(已删/被拦截/登录失效/未知)在前,正常在后
+STATUS_ORDER = ["deleted", "blocked", "login_expired", "unknown", "alive"]
 
 with open(Path(__file__).parent / "style.css") as f:
     _css = f.read()
@@ -606,17 +607,30 @@ def page_check():
             for r in results:
                 counts[r["status"]] = counts.get(r["status"], 0) + 1
 
-            # 一行:大标题 | KPI 卡(可点击筛选) | 按钮区
+            # 页头:左「大标题+meta」右「搜索框」;KPI 卡下移与按钮同一行
+            # (版式与历史/监控页一致)
             filt = app.storage.user.setdefault("res_filter", "all")
+            res_q = app.storage.user.setdefault("res_q", "")
 
             def apply_filter(key):
                 app.storage.user["res_filter"] = key
                 ui.navigate.reload()
 
-            with ui.row().classes("w-full items-center justify-between gap-4 mb-3"):
-                html(f'<div><div class="pg-title">评价链接批量检测</div>'
-                     f'<div class="pg-meta">本轮 {len(results)} 条 · '
-                     f'{results[0]["checked_at"]}</div></div>')
+            def apply_search():
+                app.storage.user["res_q"] = q.value
+                ui.navigate.reload()
+
+            with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
+                meta = html(f'<div><div class="pg-title">评价链接批量检测</div>'
+                            f'<div class="pg-meta">本轮 {len(results)} 条 · '
+                            f'{results[0]["checked_at"]}</div></div>')
+                q = ui.input(value=res_q, placeholder="搜索 ID / 标题 / 作者 …") \
+                    .props("outlined dense hide-bottom-space") \
+                    .classes("w-64").style("font-size:13px")
+                q.on("keydown",
+                     lambda e: apply_search() if e.args.get("key") == "Enter" else None)
+            # KPI 卡 + 操作按钮同一行:左 KPI 卡,右按钮(与历史/监控页同版式)
+            with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
                 # KPI 卡即筛选器:点状态卡只看该状态,再点恢复全部
                 def kpi_btn(label, value, tone, key):
                     active = filt == key
@@ -628,7 +642,7 @@ def page_check():
                     b.on("click", lambda e, k=key: apply_filter(
                         "all" if filt == k else k))
                     b.style(f"background:{bg};border:1px solid {bd};border-radius:6px;"
-                            "padding:4px 12px;min-height:0;height:32px;cursor:pointer;"
+                            "padding:4px 9px;min-height:0;height:32px;cursor:pointer;"
                             "box-shadow:none;")
                     with b:
                         html(f'<span class="kpi-num" style="color:{color}">{value}</span>'
@@ -641,20 +655,34 @@ def page_check():
                     kpi_btn("登录失效", str(counts.get("login_expired", 0)), "violet",
                             "login_expired")
                     kpi_btn("未知", str(counts.get("unknown", 0)), "ink", "unknown")
-                with ui.row().classes("items-center gap-2"):
+                with ui.row().classes("items-center gap-2 flex-none"):
                     # 两个按钮锁同宽,免得「新一轮」字短显得一宽一窄
                     ui.button("导出 CSV", icon="download") \
                         .props("outline no-caps dense").classes("w-[116px]")
                     ui.button("新一轮", icon="refresh", on_click=lambda: (
-                        app.storage.user.update(results=[], prev={}, res_filter="all"),
+                        app.storage.user.update(results=[], prev={}, res_filter="all",
+                                                res_q=""),
                         ui.navigate.to("/")
                     )).props("unelevated no-caps dense color=primary") \
                         .classes("w-[116px]")
 
-            # 结果表(AGGrid:13px、药丸徽标、行点选;受 KPI 卡筛选)
+            # 结果表(AGGrid:13px、药丸徽标、行点选;受 KPI 卡筛选+搜索框过滤)
             shown = [r for r in results if filt == "all" or r["status"] == filt]
-            # 输入乱序时展示仍按国家聚拢(AU/BR/IN/JP/MX/US...),同站点内保持输入顺序
-            shown.sort(key=lambda r: DOMAIN_SHORT(r["domain"]))
+            kw = (res_q or "").strip().lower()
+            if kw:
+                shown = [r for r in shown if kw in " ".join(
+                    (r.get(k) or "") for k in
+                    ("review_id", "url", "title", "author", "note")).lower()]
+                meta.set_content(
+                    f'<div><div class="pg-title">评价链接批量检测</div>'
+                    f'<div class="pg-meta">本轮 {len(results)} 条 · '
+                    f'{results[0]["checked_at"]} · 搜索“{res_q.strip()}” · '
+                    f'显示 {len(shown)} 条</div></div>')
+            # 输入乱序时展示仍按国家聚拢(AU/BR/IN/JP/MX/US...),
+            # 同站点内问题状态(已删/被拦截/登录失效/未知)在前,正常在后,其余保持输入顺序
+            shown.sort(key=lambda r: (DOMAIN_SHORT(r["domain"]),
+                                      STATUS_ORDER.index(r["status"])
+                                      if r["status"] in STATUS_ORDER else 99))
             rows = []
             for r in shown:
                 p = prev.get(r["review_id"])
@@ -738,15 +766,30 @@ def detail_dialog(r: dict):
 def page_history():
     with build_shell("/history"):
         days = {"kw": 7}
+        # 切卡筛选:国家 + 状态(全部/正常/已删),数据在前端按已加载行过滤
+        CC_ORDER = ["全部", "IN", "AU", "US", "JP", "MX", "BR"]
+        CC_FLAGS = {"IN": "🇮🇳", "AU": "🇦🇺", "US": "🇺🇸", "JP": "🇯🇵",
+                    "MX": "🇲🇽", "BR": "🇧🇷"}
+        ST_CARDS = [("全部", "all"), ("正常", "alive"), ("已删", "deleted")]
+        cur = {"cc": "全部", "st": "all"}
+        rows_all = []  # 当前时间范围内的全部行(含原始字段)
 
-        # 页头:左「标题+副行」上下两行,右「时间范围+统计」(与首页/监控页同版式)
+        # 页头:左「标题+副行」上下两行,右「搜索框」(时间/统计按钮下移到切卡同一行,
+        # 版式与监控页一致:搜索框在按钮区上方)
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
             with ui.column().classes("gap-0"):
                 html('<div class="pg-title">评价链接检测历史</div>')
                 meta = html('')
-            with ui.row().classes("items-center gap-2"):
+            q = ui.input(placeholder="搜索 ID / 标题 / 作者 / 备注 …") \
+                .props("outlined dense hide-bottom-space") \
+                .classes("w-64").style("font-size:13px")
+
+        # 切卡 + 时间范围/统计按钮同一行:左切卡,右按钮(与监控页国家卡+按钮同版式)
+        with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
+            cards_row = ui.row().classes("items-center gap-2 flex-grow")
+            with ui.row().classes("items-center gap-2 flex-none"):
                 # 时间范围:三个独立按钮,选中态 = 浅蓝底+蓝字(非实心,与空心按钮同族)
-                # 四个按钮锁同宽,字数不齐也排整齐
+                # 四个按钮锁同宽,字数不齐也排整齐;80px 给左侧 10 张切卡腾位
                 range_btns = {}
                 for val, label in [(7, "近 7 天"), (30, "近 30 天"), (None, "全部")]:
                     def _pick(v=val):
@@ -758,10 +801,10 @@ def page_history():
                                 bb.classes(remove="bg-[#eff6ff] text-[#2563eb]")
                         load_rows()
                     range_btns[val] = ui.button(label, on_click=_pick) \
-                        .props("outline no-caps dense").classes("w-[88px]")
+                        .props("outline no-caps dense").classes("w-[80px]")
                 range_btns[7].classes(add="bg-[#eff6ff] text-[#2563eb]")
                 ui.button("统计", icon="bar_chart", on_click=lambda: stats_dialog(days["kw"])) \
-                    .props("outline no-caps dense").classes("w-[88px]")
+                    .props("outline no-caps dense").classes("w-[80px]")
 
         def h_row(r):
             rid, domain, url, status, stars, title, author, review_date, note, checked = r
@@ -774,13 +817,73 @@ def page_history():
                 "author": author or "—",
                 "review_date": review_date or "—",
                 "note": note or "—",
+                "_status": status,
+                # 搜索索引:原始字段小写拼接(ID/URL/标题/作者/备注),显示用的"—"不参与
+                "_hay": " ".join((x or "").lower() for x in (rid, url, title, author, note)),
             }
 
         def set_meta(n):
             days_txt = {7: "近 7 天", 30: "近 30 天", None: "全部时间"}[days["kw"]]
+            filt = ""
+            if cur["cc"] != "全部":
+                filt += f" · {cur['cc']}"
+            if cur["st"] != "all":
+                filt += f" · {STATUS_LABEL.get(cur['st'], cur['st'])}"
+            kw = (q.value or "").strip()
+            if kw:
+                filt += f" · 搜索“{kw}”"
             meta.set_content(
-                f'<div class="pg-meta">{days_txt} · 共 {n} 条(最多 500) · '
-                f'每次检测自动留存</div>')
+                f'<div class="pg-meta">{days_txt}{filt} · 显示 {n} 条'
+                f'(范围共 {len(rows_all)} 条,最多 500) · 每次检测自动留存</div>')
+
+        def build_cards():
+            # 数量按当前时间范围统计;国家卡固定显示(0 条也显示,避免空范围下卡片全消失)
+            cards_row.clear()
+            with cards_row:
+                cc_counts = {}
+                st_counts = {}
+                for r in rows_all:
+                    cc_counts[r["domain"]] = cc_counts.get(r["domain"], 0) + 1
+                    st_counts[r["_status"]] = st_counts.get(r["_status"], 0) + 1
+
+                def seg(label, num, key, kind):
+                    active = cur[kind] == key
+                    bg = "#eff6ff" if active else "#fff"
+                    bd = "#2563eb" if active else "#e2e8f0"
+                    num_color = "#2563eb" if active else "#1e293b"
+                    b = ui.button(on_click=lambda e: pick(kind, key)) \
+                        .props("flat no-caps dense")
+                    b.style(f"background:{bg};border:1px solid {bd};border-radius:6px;"
+                            "padding:4px 9px;min-height:0;height:32px;cursor:pointer;"
+                            "box-shadow:none;")
+                    with b:
+                        flag = CC_FLAGS.get(key, "")
+                        html(f'<span class="kpi-num" style="color:{num_color}">'
+                             f'{num}</span>'
+                             f'<span class="kpi-tag">{label}{(" " + flag) if flag else ""}</span>')
+
+                for cc in CC_ORDER:
+                    seg(cc, len(rows_all) if cc == "全部" else cc_counts.get(cc, 0),
+                        cc, "cc")
+                ui.separator().props("vertical").classes("self-stretch bg-[#e2e8f0]")
+                for lab, key in ST_CARDS:
+                    seg(lab, len(rows_all) if key == "all" else st_counts.get(key, 0),
+                        key, "st")
+
+        def pick(kind, key):
+            cur[kind] = key
+            apply_filter()
+
+        def apply_filter():
+            kw = (q.value or "").strip().lower()
+            shown = [r for r in rows_all
+                     if (cur["cc"] == "全部" or r["domain"] == cur["cc"])
+                     and (cur["st"] == "all" or r["_status"] == cur["st"])
+                     and (not kw or kw in r["_hay"])]
+            grid.options["rowData"] = shown
+            grid.update()
+            build_cards()
+            set_meta(len(shown))
 
         grid = ui.aggrid({
             "columnDefs": [
@@ -802,10 +905,15 @@ def page_history():
         }, html_columns=[2, 4, 5]).classes("w-full ag-dense ag-fill")
 
         def load_rows():
-            data_rows = [h_row(r) for r in recent_history(500, days["kw"])]
-            grid.options["rowData"] = data_rows
-            grid.update()
-            set_meta(len(data_rows))
+            # 换时间范围时重置切卡筛选,重新统计卡片数量;搜索词保留继续生效
+            cur["cc"] = "全部"
+            cur["st"] = "all"
+            rows_all.clear()
+            rows_all.extend(h_row(r) for r in recent_history(500, days["kw"]))
+            apply_filter()
+
+        # 搜索回车触发(与监控页一致)
+        q.on("keydown", lambda e: apply_filter() if e.args.get("key") == "Enter" else None)
 
         load_rows()
 
@@ -1286,7 +1394,7 @@ def page_monitor():
                     b = ui.button(on_click=lambda e, k=cc: pick(k)) \
                         .props("flat no-caps dense")
                     b.style(f"background:{bg};border:1px solid {bd};border-radius:6px;"
-                            "padding:4px 12px;min-height:0;height:32px;cursor:pointer;"
+                            "padding:4px 9px;min-height:0;height:32px;cursor:pointer;"
                             "box-shadow:none;")
                     with b:
                         flag = CC_FLAGS.get(cc, "")

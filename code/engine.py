@@ -180,7 +180,8 @@ def _extract_fields(page: Page) -> dict:
             if m:
                 stars = m.group(1)
 
-    # permalink 页标题锚点内含 [星级span, 标题span],取最后一个 span
+    # 标题:旧 permalink 页是 a[data-hook="review-title"](内含星级+标题两个 span,取最后一个);
+    # 新版 portal 页是 h5[data-hook="reviewTitle"](驼峰命名),两者都试
     title = ""
     el = page.query_selector('a[data-hook="review-title"]')
     if el:
@@ -188,6 +189,8 @@ def _extract_fields(page: Page) -> dict:
         title = spans[-1].inner_text().strip() if spans else el.inner_text().strip()
     if not title:
         title = _txt(page, '[data-hook="review-title"]')
+    if not title:
+        title = _txt(page, '[data-hook="reviewTitle"]')
 
     return {
         "stars": stars,
