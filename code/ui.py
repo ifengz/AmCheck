@@ -658,7 +658,7 @@ def page_check():
                     {"headerName": "评价日期", "field": "review_date", "width": 134},
                     {"headerName": "上次检测", "field": "last", "width": 200},
                     {"headerName": "判定依据", "field": "note", "minWidth": 160, "flex": 2},
-                    {"headerName": "检测时间", "field": "checked_at", "width": 104},
+                    {"headerName": "检测时间", "field": "checked_at", "width": 168},
                 ],
                 "rowData": rows,
                 "defaultColDef": {"sortable": True, "resizable": True,
@@ -751,7 +751,8 @@ def page_history():
 
         grid = ui.aggrid({
             "columnDefs": [
-                {"headerName": "检测时间", "field": "checked", "width": 148, "pinned": "left"},
+                {"headerName": "检测时间", "field": "checked", "width": 168,
+                 "pinned": "left", "suppressSizeToFit": True},
                 {"headerName": "Review ID", "field": "review_id", "width": 148, "pinned": "left"},
                 {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
                 {"headerName": "站点", "field": "domain", "width": 62},
