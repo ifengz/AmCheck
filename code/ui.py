@@ -708,7 +708,8 @@ def page_check():
                     {"headerName": "状态", "field": "status_text", "width": 80,
                      "pinned": "left"},
                     {"headerName": "Review ID", "field": "review_id", "width": 148,
-                     "pinned": "left"},
+                     "pinned": "left", "tooltipField": "review_id",
+                     "cellClass": "rid-copy"},
                     {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
                     {"headerName": "站点", "field": "domain", "width": 62},
                     {"headerName": "星级", "field": "stars", "width": 62},
@@ -725,9 +726,17 @@ def page_check():
                                   "suppressMovable": True},
                 "rowHeight": 30,
             }, html_columns=[0, 2, 4]).classes("w-full ag-dense ag-fill")
-            grid.on("cellClicked", lambda e: detail_dialog(
-                next(r for r in results if r["review_id"] == e.args["data"]["_id"]))
-                if e.args.get("colId") != "link" else None)
+            def on_cell_click(e):
+                rid = e.args["data"]["_id"]
+                col = e.args.get("colId")
+                if col == "review_id":
+                    # 点 ID 格 = 复制完整 ID(显示截断不影响),不开详情
+                    ui.run_javascript(
+                        f"copyText({json.dumps(rid)});showCopyToast('ID 已复制')")
+                elif col != "link":
+                    detail_dialog(next(r for r in results
+                                       if r["review_id"] == rid))
+            grid.on("cellClicked", on_cell_click)
 
 
 def detail_dialog(r: dict):
@@ -889,7 +898,9 @@ def page_history():
             "columnDefs": [
                 {"headerName": "检测时间", "field": "checked", "width": 168,
                  "pinned": "left", "suppressSizeToFit": True},
-                {"headerName": "Review ID", "field": "review_id", "width": 148, "pinned": "left"},
+                {"headerName": "Review ID", "field": "review_id", "width": 148,
+                 "pinned": "left", "tooltipField": "review_id",
+                 "cellClass": "rid-copy"},
                 {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
                 {"headerName": "站点", "field": "domain", "width": 62},
                 {"headerName": "状态", "field": "status_text", "width": 78},
@@ -903,6 +914,12 @@ def page_history():
             "defaultColDef": {"sortable": True, "resizable": True},
             "rowHeight": 30,
         }, html_columns=[2, 4, 5]).classes("w-full ag-dense ag-fill")
+
+        # 点 Review ID 格 = 复制完整 ID(显示截断不影响)
+        grid.on("cellClicked", lambda e: ui.run_javascript(
+            f"copyText({json.dumps(e.args['data']['review_id'])});"
+            f"showCopyToast('ID 已复制')")
+            if e.args.get("colId") == "review_id" else None)
 
         def load_rows():
             # 换时间范围时重置切卡筛选,重新统计卡片数量;搜索词保留继续生效

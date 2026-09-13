@@ -138,3 +138,6 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 
 /* 进度条 */
 .q-linear-progress {border-radius: 999px;}
+
+/* Review ID 格可点击复制:复制光标提示 */
+.ag-cell.rid-copy {cursor: copy;}
