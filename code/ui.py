@@ -1151,23 +1151,12 @@ def page_monitor():
         has_data = (MONITOR_DB.exists()
                     and monitor_store.count_snapshots(MONITOR_DB) > 0)
 
-        # 页头:左「标题+副行摘要」上下两行,右「操作+搜索」(与首页/历史页同版式)
+        # 页头:左「标题+副行摘要」,右搜索框(操作按钮下移到国家切卡同一行)
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
             with ui.column().classes("gap-0"):
                 html('<div class="pg-title">链接监控</div>')
                 summary = html('')
             with ui.row().classes("items-center gap-2"):
-                btn_run = ui.button(
-                    "跑一轮采集",
-                    on_click=lambda: run_monitor_round(
-                        refresh, btn_run, prog, prog_text, prog_row)) \
-                    .props("outline no-caps dense")
-                ui.button("添加监控", icon="add_link",
-                          on_click=lambda: add_monitor_dialog(refresh)) \
-                    .props("unelevated no-caps dense color=primary")
-                ui.button("定时与通知", icon="schedule",
-                          on_click=schedule_dialog) \
-                    .props("outline no-caps dense")
                 if has_data:
                     q = ui.input(placeholder="搜索标题 / ASIN / URL …") \
                         .props("outlined dense hide-bottom-space") \
@@ -1180,20 +1169,37 @@ def page_monitor():
             prog_text = ui.label("").classes("pg-meta")
         prog_row.set_visibility(False)
 
+        # 国家切卡 + 操作按钮同一行:左侧国家卡,右侧三个按钮(右缘与搜索框对齐)
+        cur = {"cc": "全部"}
+        with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
+            card_holder = ui.row().classes("items-center gap-2 flex-grow")
+            with ui.row().classes("items-center gap-2 flex-none"):
+                btn_run = ui.button(
+                    "跑一轮采集",
+                    on_click=lambda: run_monitor_round(
+                        refresh, btn_run, prog, prog_text, prog_row)) \
+                    .props("outline no-caps dense").classes("w-[116px]")
+                ui.button("添加监控", icon="add_link",
+                          on_click=lambda: add_monitor_dialog(refresh)) \
+                    .props("unelevated no-caps dense color=primary") \
+                    .classes("w-[116px]")
+                ui.button("定时与通知", icon="schedule",
+                          on_click=schedule_dialog) \
+                    .props("outline no-caps dense").classes("w-[116px]")
+
         if not has_data:
-            # 空态只换正文区,页头不动;给真实入口(添加监控 / 演示数据)
+            # 空态只换正文区,页头/按钮位不动;给真实入口
             summary.set_content('<div class="pg-meta">盯住产品页变化:价格 / 评分 / '
                                 '评价数 / 上下架</div>')
             html('<div class="pg-meta" style="margin:8px 0 12px">还没有监控数据:'
                  '先「添加监控」粘贴商品链接,再「跑一轮采集」生成看板;'
                  '或先打开演示数据看效果。</div>')
-            ui.button("打开演示数据", icon="science", on_click=toggle_mock) \
-                .props("outline no-caps")
+            with ui.row().classes("items-center gap-2"):
+                ui.button("打开演示数据", icon="science", on_click=toggle_mock) \
+                    .props("outline no-caps dense").classes("w-[116px]")
             return
 
         # 国家切卡:全部 + IN/AU/US/JP/MX/BR,点某国只看该国,再点恢复全部
-        cur = {"cc": "全部"}
-        card_holder = ui.row().classes("w-full items-center gap-2 mb-2")
         grid_holder = ui.column().classes("w-full")
         # 表格下方文案区:点行后展示该 ASIN 的标题 / BP / DP 全文
         text_holder = ui.column().classes("w-full")
