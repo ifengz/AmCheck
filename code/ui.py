@@ -613,11 +613,14 @@ def page_check():
                             "login_expired")
                     kpi_btn("未知", str(counts.get("unknown", 0)), "ink", "unknown")
                 with ui.row().classes("items-center gap-2"):
-                    ui.button("导出 CSV", icon="download").props("outline no-caps dense")
+                    # 两个按钮锁同宽,免得「新一轮」字短显得一宽一窄
+                    ui.button("导出 CSV", icon="download") \
+                        .props("outline no-caps dense").classes("w-[116px]")
                     ui.button("新一轮", icon="refresh", on_click=lambda: (
                         app.storage.user.update(results=[], prev={}, res_filter="all"),
                         ui.navigate.to("/")
-                    )).props("unelevated no-caps dense color=primary")
+                    )).props("unelevated no-caps dense color=primary") \
+                        .classes("w-[116px]")
 
             # 结果表(AGGrid:13px、药丸徽标、行点选;受 KPI 卡筛选)
             shown = [r for r in results if filt == "all" or r["status"] == filt]
