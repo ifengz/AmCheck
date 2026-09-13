@@ -62,7 +62,8 @@ def init_db(path: Path = DEFAULT_DB) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS ix_snap_time "
                      "ON snapshots (checked_at)")
         # 旧库补列:bullets/description 是后加的采集字段;
-        # bsr_cat/bsr_sub = BSR 大类/小类名(如 Home / Desk Lamps)
+        # bsr_cat/bsr_sub = BSR 大类/小类名(如 Home / Desk Lamps);
+        # model_number = 商品页型号(推送里当 SKU 展示)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshots)")}
         if "bullets" not in cols:
             conn.execute("ALTER TABLE snapshots ADD COLUMN bullets TEXT DEFAULT '[]'")
@@ -72,6 +73,18 @@ def init_db(path: Path = DEFAULT_DB) -> None:
             conn.execute("ALTER TABLE snapshots ADD COLUMN bsr_cat TEXT DEFAULT ''")
         if "bsr_sub" not in cols:
             conn.execute("ALTER TABLE snapshots ADD COLUMN bsr_sub TEXT DEFAULT ''")
+        if "model_number" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN model_number TEXT DEFAULT ''")
+        pcols = {r[1] for r in conn.execute("PRAGMA table_info(profiles)")}
+        if "model_number" not in pcols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN model_number TEXT DEFAULT ''")
+        if "ai_prompt" not in pcols:
+            # 该链接专属 AI 解读规范(优先于国家/全局 prompt)
+            conn.execute("ALTER TABLE profiles ADD COLUMN ai_prompt TEXT DEFAULT ''")
+        if "seed_asin" not in pcols:
+            # 变体族:非空表示本行是从该种子 ASIN 的变体里带进来的子体
+            # (自动登记时 monitor_enabled=0,由用户在监控页勾选启用)
+            conn.execute("ALTER TABLE profiles ADD COLUMN seed_asin TEXT DEFAULT ''")
 
         # 检测出的异常(用于去重/通知/已读)
         conn.execute("""
@@ -84,11 +97,22 @@ def init_db(path: Path = DEFAULT_DB) -> None:
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_anom_asdomain_time "
                      "ON anomalies (asin, domain, checked_at)")
+        acols = {r[1] for r in conn.execute("PRAGMA table_info(anomalies)")}
+        if "detail" not in acols:
+            # 差评告警附带的差评正文(多行,推送时缩进展示)
+            conn.execute("ALTER TABLE anomalies ADD COLUMN detail TEXT DEFAULT ''")
 
         # 应用设置(键值):定时采集间隔/开关、钉钉 webhook、通知静默期等
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+
+        # 已推送过的差评(按单条正文哈希去重):同一 ASIN 同一条差评只推一次,
+        # 与静默期/指标级去重独立——新差评一定能推,旧差评绝不重复推。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_push_state (
+                asin TEXT, domain TEXT, rhash TEXT, pushed_at REAL,
+                PRIMARY KEY (asin, domain, rhash))""")
 
 
 # ---------- settings ----------
@@ -105,6 +129,16 @@ def set_setting(path: Path, key: str, value: str) -> None:
         conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                      (key, str(value)))
+
+
+def list_settings(path: Path) -> list[tuple[str, str]]:
+    with _connect(path) as conn:
+        return conn.execute("SELECT key, value FROM settings").fetchall()
+
+
+def del_setting(path: Path, key: str) -> None:
+    with _connect(path) as conn:
+        conn.execute("DELETE FROM settings WHERE key=?", (key,))
 
 
 # ---------- profiles ----------
@@ -193,6 +227,81 @@ def update_last_checked(path: Path, asin: str, domain: str, ts: str) -> None:
             (ts, asin, domain))
 
 
+def set_model_number(path: Path, asin: str, domain: str, model_number: str) -> None:
+    """采集后把页面上抓到的 Model Number 回写 profile(空值不覆盖已有值)。"""
+    if not model_number:
+        return
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE profiles SET model_number=? WHERE asin=? AND domain=? "
+            "AND (model_number IS NULL OR model_number='')",
+            (model_number, asin, domain))
+
+
+def set_profile_ai_prompt(path: Path, asin: str, domain: str, prompt: str) -> None:
+    """该链接专属 AI 解读规范(空=删除,回退国家/全局层)。"""
+    with _connect(path) as conn:
+        conn.execute("UPDATE profiles SET ai_prompt=? WHERE asin=? AND domain=?",
+                     (prompt.strip(), asin, domain))
+
+
+def set_profile_enabled(path: Path, asin: str, domain: str, enabled: int) -> None:
+    """启用/停用一条监控(变体子体勾选用)。停用=不再采集,历史数据保留。"""
+    with _connect(path) as conn:
+        conn.execute("UPDATE profiles SET monitor_enabled=? "
+                     "WHERE asin=? AND domain=?",
+                     (1 if enabled else 0, asin, domain))
+
+
+def register_variants(path: Path, seed_asin: str, domain: str,
+                      variants: list[str], limit: int = 20) -> int:
+    """把种子 ASIN 的变体自动登记为子体:默认 monitor_enabled=0(只登记不采集)。
+
+    已存在的行(无论手动添加还是已登记的)保持原样——不覆盖 enabled,
+    这样用户勾选过的子体不会被重置。返回新登记数量。
+    """
+    if not variants:
+        return 0
+    n = 0
+    with _connect(path) as conn:
+        for v in variants[:limit]:
+            if not v or v == seed_asin:
+                continue
+            row = conn.execute(
+                "SELECT id FROM profiles WHERE asin=? AND domain=?",
+                (v, domain)).fetchone()
+            if row:
+                continue      # 已存在:尊重用户当前勾选状态
+            conn.execute(
+                """INSERT INTO profiles (asin, domain, url, seed_asin,
+                       monitor_enabled, metric_config, last_checked_at)
+                   VALUES (?,?,?,?,0,'{}','')""",
+                (v, domain, f"https://www.{domain}/dp/{v}", seed_asin))
+            n += 1
+    return n
+
+
+def family_members(path: Path, seed_asin: str, domain: str) -> list[dict]:
+    """一个变体族的成员:种子 + 已登记子体(含未启用的)。"""
+    with _connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT * FROM profiles
+               WHERE domain=? AND (asin=? OR seed_asin=?)
+               ORDER BY (seed_asin='') DESC, asin""",
+            (domain, seed_asin, seed_asin)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def family_seed_of(path: Path, asin: str, domain: str) -> str:
+    """该 ASIN 所属族的种子(自身就是种子则返回自己)。"""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT seed_asin FROM profiles WHERE asin=? AND domain=?",
+            (asin, domain)).fetchone()
+    return (row[0] or asin) if row else asin
+
+
 # ---------- snapshots ----------
 
 def insert_snapshot(path: Path, snap: SnapshotRecord) -> int:
@@ -200,14 +309,15 @@ def insert_snapshot(path: Path, snap: SnapshotRecord) -> int:
     import json
     with _connect(path) as conn:
         cur = conn.execute("""
-            INSERT INTO snapshots (asin, domain, checked_at, title, image_url,
-                buybox, parent_asin, variations, price, price_value, currency,
-                rating, review_count, bsr, bsr_cat, bsr_sub,
+            INSERT INTO snapshots (asin, domain, checked_at, title, model_number,
+                image_url, buybox, parent_asin, variations, price, price_value,
+                currency, rating, review_count, bsr, bsr_cat, bsr_sub,
                 deal_tag, availability, status,
                 bullets, description, home_reviews, note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 snap.asin, snap.domain, snap.checked_at, snap.title,
+                getattr(snap, "model_number", "") or "",
                 snap.image_url, snap.buybox, snap.parent_asin,
                 json.dumps(snap.variations or []), snap.price, snap.price_value,
                 snap.currency, snap.rating, snap.review_count, snap.bsr,
@@ -265,9 +375,9 @@ def insert_anomaly(path: Path, a: dict) -> int:
     with _connect(path) as conn:
         cur = conn.execute("""
             INSERT INTO anomalies (asin, domain, metric, change_type, old_value,
-                new_value, severity, checked_at, notified, confirmed)
+                new_value, severity, checked_at, notified, confirmed, detail)
             VALUES (:asin, :domain, :metric, :change_type, :old_value, :new_value,
-                    :severity, :checked_at, :notified, :confirmed)
+                    :severity, :checked_at, :notified, :confirmed, :detail)
             """, {
                 "asin": a["asin"], "domain": a["domain"],
                 "metric": a.get("metric", ""),
@@ -278,6 +388,7 @@ def insert_anomaly(path: Path, a: dict) -> int:
                 "checked_at": a.get("checked_at", ""),
                 "notified": int(a.get("notified", 0)),
                 "confirmed": int(a.get("confirmed", 0)),
+                "detail": str(a.get("detail", ""))[:2000],
             })
         return cur.lastrowid
 

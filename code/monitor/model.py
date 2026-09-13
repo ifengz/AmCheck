@@ -57,6 +57,7 @@ class SnapshotRecord:
     domain: str
     checked_at: str                                        # "YYYY-MM-DD HH:MM:SS"
     title: str = ""
+    model_number: str = ""                                 # 商品页 Model Number(型号),推送里当 SKU 用
     image_url: str = ""
     buybox: str = ""                                       # 当前 BuyBox 归属(卖家名),空=无人持有
     parent_asin: str = ""

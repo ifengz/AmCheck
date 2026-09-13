@@ -97,6 +97,9 @@ if __name__ == "__main__":
                          "不填则跑单轮退出(适合外部 cron/宝塔计划任务拉起)")
     ap.add_argument("--serial", action="store_true",
                     help="禁用站点并行,退回逐站串行(调试用)")
+    ap.add_argument("--chat", action="store_true",
+                    help="守护模式下同时拉起钉钉聊天机器人(Stream 长连接,"
+                         "可@机器人查监控/问问题)")
     args = ap.parse_args()
     if args.no_notify:
         os.environ["AMCHECK_NOTIFY_DISABLE"] = "1"
@@ -105,6 +108,10 @@ if __name__ == "__main__":
 
     # 守护模式:常驻进程,按 N 小时循环(误炸异常不退出,记日志继续)
     log(f"进入守护模式:每 {args.interval:g} 小时一轮,Ctrl-C 退出")
+    if args.chat:
+        from monitor.chatbot import start_in_thread
+        start_in_thread(DB)
+        log("钉钉聊天机器人已拉起(Stream 长连接)")
     while True:
         try:
             run_scheduled(args.domain, parallel=not args.serial)

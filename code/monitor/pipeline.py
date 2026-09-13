@@ -38,6 +38,14 @@ def run_round(db_path, adapter: BaseAdapter, profiles=None,
         snap_id = store.insert_snapshot(db_path, snap)
         checked += 1
         store.update_last_checked(db_path, p["asin"], p["domain"], snap.checked_at)
+        # 页面上抓到的型号回写 profile,推送/看板当 SKU 展示
+        store.set_model_number(db_path, p["asin"], p["domain"],
+                               getattr(snap, "model_number", ""))
+        # 变体自动登记:种子 ASIN 抓到的变体登记为子体(默认不采集,
+        # 由用户在监控页勾选启用);子体不递归扩散,避免一传十
+        if not p.get("seed_asin"):
+            store.register_variants(db_path, p["asin"], p["domain"],
+                                    list(snap.variations or []))
 
         prev_snaps = store.snapshots_for(db_path, p["asin"], p["domain"])
         # 含刚写回的本条:period = 全部历史快照 = 该 ASIN 的观测期

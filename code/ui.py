@@ -985,6 +985,8 @@ MON_EXTRA_FIELDS = {
                 lambda v: v or "—", "text"),
     "bsr_sub": ("bsr_sub", "小类", lambda s: s.get("bsr_sub"),
                 lambda v: v or "—", "text"),
+    "model_number": ("model_number", "型号", lambda s: s.get("model_number"),
+                     lambda v: v or "—", "text"),
 }
 
 # 抽屉切卡分组:同类字段合并一张卡,明细表里一字段一列并排看
@@ -993,7 +995,7 @@ MON_GROUPS = [
     ("price", "价格", ["price", "buybox", "deal_tag"]),
     ("reviews", "评价", ["rating", "review_count", "recent_bad"]),
     ("bsr", "BSR", ["bsr", "bsr_cat", "bsr_sub"]),
-    ("status", "状态", ["availability", "status"]),
+    ("status", "状态", ["availability", "status", "model_number"]),
     ("copy", "文案", ["bullets", "description"]),
 ]
 MON_FIELD_GROUP = {fk: gk for gk, _, fks in MON_GROUPS for fk in fks}
@@ -1225,6 +1227,44 @@ def page_monitor():
                             del_btn.props("unelevated")
                         else:
                             _delete()
+            # 变体族:种子 + 自动登记的子体,勾选哪些参与采集(默认不勾)
+            seed = monitor_store.family_seed_of(MONITOR_DB, asin, domain)
+            fam = monitor_store.family_members(MONITOR_DB, seed, domain)
+            if len(fam) > 1:
+                html(f'<div class="card-title" style="font-size:14px;margin-top:6px">'
+                     f'变体族 · 共 {len(fam)} 个</div>')
+                html('<div class="pg-meta">采集时自动发现的子体默认不采集;'
+                     '勾选后才进监控和告警。取消勾选即停采集(历史数据保留)。</div>')
+                with ui.column().classes("w-full gap-0"):
+                    for m in fam:
+                        is_seed = not (m.get("seed_asin") or "")
+                        with ui.row().classes("w-full items-center gap-2"):
+                            sw = ui.switch(value=bool(m["monitor_enabled"])) \
+                                .props("dense")
+                            def _toggle(e, mem=m, s=sw):
+                                monitor_store.set_profile_enabled(
+                                    MONITOR_DB, mem["asin"], mem["domain"],
+                                    1 if s.value else 0)
+                                ui.notify(
+                                    f"{'启用' if s.value else '停用'} {mem['asin']}",
+                                    type="positive")
+                            sw.on_value_change(_toggle)
+                            label = m["asin"] + ("（主商品）" if is_seed else "")
+                            html(f'<span style="font-family:ui-monospace,monospace;'
+                                 f'font-size:12px">{label}</span>'
+                                 + (f'<span class="pg-meta"> {m["title"][:28]}</span>'
+                                    if m.get("title") else ""))
+            # 本链接专属 AI 解读规范(优先于国家/全局);空=不单独定制
+            with ui.row().classes("w-full items-end gap-2 mt-1"):
+                ap = ui.input("本链接 AI 解读规范(留空=用国家/全局)",
+                              value=p.get("ai_prompt") or "") \
+                    .props("outlined dense").classes("flex-grow")
+                def _save_ap():
+                    monitor_store.set_profile_ai_prompt(
+                        MONITOR_DB, asin, domain, ap.value or "")
+                    ui.notify("已保存该链接的解读规范", type="positive")
+                ui.button("保存", on_click=_save_ap) \
+                    .props("outline no-caps dense")
             # 纵向切卡:同类字段合并一张卡,明细表一字段一列并排
             def _grp_fields(fkeys):
                 out = []
@@ -1566,6 +1606,33 @@ def schedule_dialog():
         html('<div class="pg-meta">有新增异常时推送;静默期内同一 ASIN 的'
              '同类变化只提醒一次,防刷屏。</div>')
 
+        ui.separator()
+        # AI 解读:推送里每个 ASIN 下加一句人话总结;不配 key 则整段跳过
+        html('<div class="card-title" style="font-size:14px">AI 解读(可选)</div>')
+        from monitor import ai as _ai
+        aicfg = _ai.get_ai_config(MONITOR_DB)
+        akey = ui.input("API Key(留空则关闭 AI 解读)",
+                        value=aicfg["key"], password=True) \
+            .props("outlined dense").classes("w-full")
+        with ui.row().classes("w-full items-center gap-2"):
+            abase = ui.input("Base URL", value=aicfg["base"]) \
+                .props("outlined dense").classes("flex-grow")
+            amodel = ui.input("模型", value=aicfg["model"]) \
+                .props("outlined dense").classes("w-48")
+        aprompt = ui.textarea("全局解读规范(告诉 AI 什么该强调、什么别当回事)",
+                              value=sget(MONITOR_DB, "ai_prompt", "")) \
+            .props("outlined dense rows=3").classes("w-full")
+        aprompt.placeholder = "例:价格降5%以内只提一句;BuyBox易主必须点名新卖家;结论优先说要不要人工介入"
+        acountry = ui.textarea("分国家解读规范(每行一条:国家码: 规范)",
+                               value="\n".join(
+                                   f"{k[10:]}: {v}" for k, v in
+                                   sorted(monitor_store.list_settings(MONITOR_DB))
+                                   if k.startswith("ai_prompt_") and v.strip())) \
+            .props("outlined dense rows=2").classes("w-full")
+        acountry.placeholder = "US: 严格,任何波动都点名\nAU: 宽松,只报下架和BuyBox"
+        html('<div class="pg-meta">优先级:单链接(点表格行在详情里配)&gt;国家&gt;全局。'
+             '改完即生效,只影响推送「解读:」那一行,不影响告警触发。</div>')
+
         def _save():
             sset(MONITOR_DB, "schedule_enabled", "1" if enabled.value else "0")
             sset(MONITOR_DB, "schedule_interval_h", str(interval.value or 6))
@@ -1577,6 +1644,19 @@ def schedule_dialog():
             sset(MONITOR_DB, "notify_robot_code", (rcode.value or "").strip())
             sset(MONITOR_DB, "notify_user_ids", (uids.value or "").strip())
             sset(MONITOR_DB, "notify_mute_h", str(mute.value or 12))
+            sset(MONITOR_DB, "ai_api_key", (akey.value or "").strip())
+            sset(MONITOR_DB, "ai_base_url", (abase.value or "").strip())
+            sset(MONITOR_DB, "ai_model", (amodel.value or "").strip())
+            sset(MONITOR_DB, "ai_prompt", (aprompt.value or "").strip())
+            # 分国家:先清旧键再按行写入(留空=删除该国家定制,回退全局)
+            for k in [k for k, _ in monitor_store.list_settings(MONITOR_DB)
+                      if k.startswith("ai_prompt_")]:
+                monitor_store.del_setting(MONITOR_DB, k)
+            for ln in (acountry.value or "").splitlines():
+                cc, _, txt = ln.partition(":")
+                cc = cc.strip().upper()
+                if cc and txt.strip():
+                    sset(MONITOR_DB, f"ai_prompt_{cc}", txt.strip())
             ui.notify("已保存,定时采集按新配置运行", type="positive")
             d.close()
 

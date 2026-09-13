@@ -173,11 +173,17 @@ def detect_snapshot(profile: dict, baseline: dict | None,
         base_bad = _new_bad_reviews(baseline.get("home_reviews") or {})
         if (hc.get("enabled", True) and cur_bad is not None
                 and base_bad is not None and cur_bad - base_bad > hc.get("max_new_bad", 2)):
+            # 附带差评条目(采集页解析的 1-2 星),存结构化 JSON;
+            # notify 按每条哈希去重,只推没推过的新差评
+            import json as _json
+            bad_items = (now.get("home_reviews") or {}).get("bad_items") or []
+            detail = _json.dumps(bad_items[:5], ensure_ascii=False)
             anomalies.append({
                 "asin": asin, "domain": domain, "metric": "home_reviews",
                 "change_type": "new_bad_reviews",
                 "old_value": base_bad, "new_value": cur_bad,
                 "severity": "warning", "checked_at": ts,
+                "detail": detail,
                 "_count": cur_bad - base_bad,
             })
 
@@ -293,7 +299,7 @@ def summarize(anomalies: list[dict]) -> list[dict]:
 
 METRIC_LABELS = {
     "title": "标题", "buybox": "丢失 BuyBox", "variations": "变体",
-    "status": "上下架", "price": "价格", "rating": "评分",
+    "status": "在售状态", "price": "价格", "rating": "评分",
     "review_count": "评价数", "bsr": "排名", "deal_tag": "Deal",
     "home_reviews": "差评", "unavailable_period": "全程断货",
 }
@@ -306,5 +312,5 @@ def _fmt(v) -> str:
 
 
 def _badge(sev: str, label: str) -> str:
-    icon = {"critical": "🚨", "warning": "⚠", "info": "ℹ"}.get(sev, "ℹ")
+    icon = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(sev, "ℹ️")
     return f"{icon} {label}"

@@ -224,6 +224,34 @@ class PlaywrightAdapter(BaseAdapter):
             if t and t.lower() not in ("amazon.in", "amazon"):
                 title = t.strip()
 
+        # Model Number(型号):详情表(tr)或详情 bullets(li)两种形态,值在标签后;
+        # 推送里代替 SKU 展示,抓不到留空
+        model_number = ""
+        for sel in ('tr:has-text("Model Number")',
+                    'tr:has-text("Item model number")',
+                    'li:has-text("Model Number")',
+                    'li:has-text("Item model number")'):
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            try:
+                txt = _clean(el.inner_text())
+            except Exception:
+                continue
+            m = re.search(r"model\s+number\s*(?:‏|‎|:|=|\n|\s)*\s*(\S[^\n]*)",
+                          txt, re.I)
+            if m:
+                val = m.group(1).strip()
+                # 去掉 bullets 行尾可能粘着的下一标签(如 "Date First Available")
+                for cut in ("Date First", "Package Dimension", "ASIN ", "Best Sellers"):
+                    idx = val.find(cut)
+                    if idx > 0:
+                        val = val[:idx]
+                val = val.strip()
+                if val:
+                    model_number = val[:60]
+                    break
+
         # 主图:优先 #landingImage 的 data-a-dynamic-image(取一张),
         # 退化到 src;再不行扫图片区首张。只存 URL,不下载。
         image_url = ""
@@ -424,8 +452,8 @@ class PlaywrightAdapter(BaseAdapter):
 
         return SnapshotRecord(
             asin=asin, domain=domain, checked_at=now_str(),
-            title=title, image_url=image_url, buybox=buybox,
-            parent_asin=parent_asin,
+            title=title, model_number=model_number, image_url=image_url,
+            buybox=buybox, parent_asin=parent_asin,
             variations=variations, price=price_text, price_value=price_val,
             currency=currency, rating=rating, review_count=review_count,
             bsr=bsr, bsr_cat=bsr_cat, bsr_sub=bsr_sub,
@@ -454,8 +482,26 @@ class PlaywrightAdapter(BaseAdapter):
             for m in re.finditer(r"(\d)\s*star\s+([\d,]+)%", txt):
                 breakdown[f"{m.group(1)}star"] = int(m.group(2).replace(",", ""))
         bad = (breakdown.get("1star", 0) or 0) + (breakdown.get("2star", 0) or 0)
-        snap.home_reviews = {"recent_bad": bad, "stars_breakdown": breakdown} \
-            if breakdown else {}
+        # 差评正文:页面上 1-2 星的评价条目,告警推送里附带展示
+        try:
+            items = page.evaluate("""(() => {
+              return [...document.querySelectorAll('[data-hook="review"]')].map(r => {
+                const starEl = r.querySelector('[data-hook="review-star-rating"]');
+                const sm = starEl ? (starEl.innerText.match(/(\\d)\\s*out of/i) || [])[1] : '';
+                const tEl = r.querySelector('[data-hook="reviewTitle"], [data-hook="review-title"]');
+                const bEl = r.querySelector('[data-hook="reviewText"], [data-hook="review-body"]');
+                return {
+                  star: sm ? parseInt(sm, 10) : null,
+                  title: tEl ? tEl.innerText.trim().slice(0, 80) : '',
+                  text: bEl ? bEl.innerText.trim().replace(/\\s+/g, ' ').slice(0, 160) : '',
+                };
+              }).filter(x => x.star && x.star <= 2).slice(0, 3);
+            })()""")
+        except Exception:
+            items = []
+        snap.home_reviews = {"recent_bad": bad, "stars_breakdown": breakdown,
+                             "bad_items": items} \
+            if breakdown or items else {}
 
     def _maybe_shot(self, page, asin) -> None:
         try:
