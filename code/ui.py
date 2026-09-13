@@ -713,7 +713,7 @@ def page_history():
         # 页头一行:左「标题+副行(含计数)」,右「时间范围+统计」——紧凑不割裂
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
             with ui.row().classes("items-center gap-3"):
-                html('<div class="pg-title">检测历史</div>')
+                html('<div class="pg-title">评价链接检测历史</div>')
                 meta = html('')
             with ui.row().classes("items-center gap-2"):
                 # 时间范围:三个独立按钮,选中态 = 浅蓝底+蓝字(非实心,与空心按钮同族)
@@ -1185,8 +1185,8 @@ def page_monitor():
                                 '评价数 / 上下架</div>')
             html('<div class="pg-meta" style="margin:8px 0 12px">还没有监控数据:'
                  '先「添加监控」粘贴商品链接,再「跑一轮采集」生成看板;'
-                 '或先载入演示数据看效果。</div>')
-            ui.button("载入演示数据", icon="science", on_click=toggle_mock) \
+                 '或先打开演示数据看效果。</div>')
+            ui.button("打开演示数据", icon="science", on_click=toggle_mock) \
                 .props("outline no-caps")
             return
 
@@ -1702,14 +1702,14 @@ def sidebar_nav():
                     '<div class="brand-sub">Amazon 评价链接批量检测</div></div>')
         ui.separator()
         for path, icon, label in [("/", "fact_check", "评价链接检测"),
-                                  ("/history", "history", "检测历史"),
+                                  ("/history", "history", "评价链接检测历史"),
                                   ("/monitor", "monitoring", "链接监控")]:
             active = app.storage.user.get("_nav") == path
             ui.link(label, path).classes(f"nav-item {'nav-active' if active else ''}") \
                 .props(f'icon={icon}')
         ui.separator()
         html('<div class="nav-group">演示与辅助</div>')
-        ui.button(("卸载演示数据" if app.storage.user.get("mock_on") else "载入演示数据"),
+        ui.button(("关闭演示数据" if app.storage.user.get("mock_on") else "打开演示数据"),
                   icon="science", on_click=toggle_mock).props("flat no-caps align=left")
         ui.separator()
         html('<div class="nav-group">账号与运行状态</div>')
