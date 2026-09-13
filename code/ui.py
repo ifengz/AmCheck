@@ -444,6 +444,7 @@ def unload_all_mock():
 
 
 init_db()
+monitor_store.init_db(MONITOR_DB)   # 监控库补列迁移(bsr_cat/bsr_sub 等)在启动时跑
 
 # ---------- 设计系统:可复用的小组件 ----------
 
@@ -549,18 +550,21 @@ def page_check():
                                 checker.close()
                             return out
                         results_new = await run.io_bound(_work)
+                        btn.props(remove="disable loading")
                         if results_new:
                             save_history(results_new)
                             app.storage.user["results"] = results_new
                             app.storage.user["prev"] = prev
                         ui.navigate.to("/")
 
-                    prog_row = ui.row().classes("w-full")
-                    with prog_row:
-                        prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
-                        prog_text = ui.label("").classes("pg-meta")
-                    prog_row.set_visibility(False)
-                    btn.on("click", do_check)
+                    return _run()
+
+                prog_row = ui.row().classes("w-full")
+                with prog_row:
+                    prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
+                    prog_text = ui.label("").classes("pg-meta")
+                prog_row.set_visibility(False)
+                btn.on("click", do_check)
         else:
             # ── 结果视图 ──
             prev = app.storage.user.get("prev", {})
@@ -784,9 +788,348 @@ def stats_dialog(days):
 
 # ---------- 页面:监控 ----------
 
+# 监控字段契约:主表矩阵列 + 抽屉切卡共用一份
+# (key, 列名, 取值, 格式化, 值类型)。key 同时用作 agGrid field 前缀与抽屉 tab name。
+# 值类型:"num" = 数字(抽屉里变化内容列省掉,上下两行直接看);"text" = 文案(词级 diff)。
+MON_FIELDS = [
+    ("title", "标题", lambda s: s.get("title"), lambda v: v or "—", "text"),
+    ("price", "价格", lambda s: s.get("price"), lambda v: v or "—", "num"),
+    ("rating", "评分", lambda s: s.get("rating"),
+     lambda v: "—" if v is None else f"{v:g}", "num"),
+    ("review_count", "评价数", lambda s: s.get("review_count"),
+     lambda v: "—" if v is None else f"{v:,}", "num"),
+    ("bsr", "BSR", lambda s: s.get("bsr"),
+     lambda v: "—" if v is None else f"{v:,}", "num"),
+    ("buybox", "BuyBox", lambda s: s.get("buybox"), lambda v: v or "无", "text"),
+    ("availability", "上下架", lambda s: s.get("availability"), lambda v: v or "—", "text"),
+    ("status", "页面状态", lambda s: s.get("status"), lambda v: v or "—", "text"),
+    ("deal_tag", "Deal", lambda s: s.get("deal_tag"), lambda v: v or "无", "text"),
+    ("recent_bad", "差评数", lambda s: (s.get("home_reviews") or {}).get("recent_bad"),
+     lambda v: "—" if v is None else str(v), "num"),
+    ("bullets", "BP 五点", lambda s: s.get("bullets") or [],
+     lambda v: ("\n".join(v) if isinstance(v, list) and v else
+                (v if isinstance(v, str) and v else "—")), "text"),
+    ("description", "DP 描述", lambda s: s.get("description"),
+     lambda v: v or "—", "text"),
+]
+MON_FIELD_LABELS = {k: lab for k, lab, _, _, _ in MON_FIELDS}
+MON_FIELD_KIND = {k: kind for k, _, _, _, kind in MON_FIELDS}
+
+# 抽屉专属字段(不进主表矩阵):BSR 大类/小类名
+MON_EXTRA_FIELDS = {
+    "bsr_cat": ("bsr_cat", "大类", lambda s: s.get("bsr_cat"),
+                lambda v: v or "—", "text"),
+    "bsr_sub": ("bsr_sub", "小类", lambda s: s.get("bsr_sub"),
+                lambda v: v or "—", "text"),
+}
+
+# 抽屉切卡分组:同类字段合并一张卡,明细表里一字段一列并排看
+MON_GROUPS = [
+    ("title", "标题", ["title"]),
+    ("price", "价格", ["price", "buybox", "deal_tag"]),
+    ("reviews", "评价", ["rating", "review_count", "recent_bad"]),
+    ("bsr", "BSR", ["bsr", "bsr_cat", "bsr_sub"]),
+    ("status", "状态", ["availability", "status"]),
+    ("copy", "文案", ["bullets", "description"]),
+]
+MON_FIELD_GROUP = {fk: gk for gk, _, fks in MON_GROUPS for fk in fks}
+MON_BY_KEY = {**MON_EXTRA_FIELDS,
+              **{k: m for m in MON_FIELDS for k in [m[0]]}}
+
+# 变化矩阵单元格:有更新=橙,无变化=灰,基准(仅一次快照)=浅灰
+_CHG_YES = '<span style="color:#b45309;font-weight:700">有更新</span>'
+_CHG_NO = '<span style="color:#94a3b8">无变化</span>'
+_CHG_BASE = '<span style="color:#cbd5e1">基准</span>'
+
+
+def _field_changed(getter, fmt, snap, prev) -> bool:
+    """该字段本次快照较上一条是否变化。展示串相同不算变(避开 None/"" 等价)。"""
+    if prev is None:
+        return False
+    v, pv = fmt(getter(snap)), fmt(getter(prev))
+    return v != pv
+
+
+def _matrix_row(db_path, asin, domain, snap, anom_by_key) -> dict:
+    """一行 = 一个 ASIN:ASIN/最后更新/每字段是否变化/异常徽标。
+
+    变化判定取最近两拍快照(本次采集 vs 上次采集)。
+    """
+    from monitor.board import _status_label
+    snaps = monitor_store.snapshots_for(db_path, asin, domain, limit=2)
+    prev = snaps[-2] if len(snaps) >= 2 else None
+    a = anom_by_key.get((asin, domain))
+    sev = (a or {}).get("severity", "ok")
+
+    img = snap.get("image_url") or ""
+    thumb = (f'<img src="{html_mod.escape(img)}" class="asin-thumb" alt="">'
+             if img.startswith("http") else
+             '<span class="asin-thumb asin-thumb-none"></span>')
+    row = {
+        "asin_html": (f'<span class="asin-cell">{thumb}'
+                      f'<b style="font-family:ui-monospace,monospace">{asin}</b></span>'),
+        "ts": (snap.get("checked_at") or "")[5:16] or "—",
+        "title": (snap.get("title") or asin)[:40],
+        "_asin": asin, "_domain": domain,
+        "_title": snap.get("title") or asin,
+        "_url": (monitor_store.get_profile(db_path, asin, domain) or {}).get("url", ""),
+        "_sev": {"critical": 0, "warning": 1, "info": 2}.get(sev, 9),
+    }
+    ts_num = 0
+    try:
+        ts_num = datetime.strptime(str(snap.get("checked_at") or "").split(".")[0],
+                                   "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        pass
+    row["_ts"] = ts_num
+    for key, _lab, getter, fmt, _kind in MON_FIELDS:
+        if prev is None:
+            row[f"chg_{key}"] = _CHG_BASE
+        else:
+            g = (lambda s: _status_label(s.get("status"))) if key == "status" else getter
+            f2 = (lambda v: v or "—") if key == "status" else fmt
+            row[f"chg_{key}"] = _CHG_YES if _field_changed(g, f2, snap, prev) else _CHG_NO
+    if a:
+        from monitor.rules import METRIC_LABELS
+        label = METRIC_LABELS.get(a["metric"], a["metric"])
+        icon = {"critical": "🚨", "warning": "⚠"}.get(sev, "ℹ")
+        cls = {"critical": "bg-[#fee2e2] text-[#b91c1c]",
+               "warning": "bg-[#fef3c7] text-[#b45309]",
+               "info": "bg-[#dbeafe] text-[#1d4ed8]"}[sev]
+        row["anomaly_html"] = f'<span class="pill {cls}">{icon} {label}</span>'
+    else:
+        row["anomaly_html"] = '<span style="color:#15803d;font-weight:600">正常</span>'
+    return row
+
+
+def _word_diff(pv: str, v: str) -> str:
+    """文案类变化内容:只展示变了的片段。
+
+    替换 = 旧 → 新;新增 = +词;删除 = -词。不重复全文。
+    """
+    import difflib
+    a, b = str(pv).split(), str(v).split()
+    sm = difflib.SequenceMatcher(None, a, b)
+    parts = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        old = " ".join(a[i1:i2])
+        new = " ".join(b[j1:j2])
+        if tag == "insert":
+            parts.append(f"+{new}")
+        elif tag == "delete":
+            parts.append(f"-{old}")
+        else:
+            parts.append(f"{old} → {new}")
+    return "；".join(parts) if parts else "—"
+
+
+def _highlight_diff(pv: str, v: str) -> str:
+    """全文高亮:与上一条对比,把变了的词段标橙底。
+
+    按"词+空白"分词,换行符原样保留(BP 每点一行不受影响)。
+    """
+    import difflib
+    import re as _re
+    tok = lambda s: _re.split(r"(\s+)", str(s))
+    a, b = tok(pv), tok(v)
+    sm = difflib.SequenceMatcher(None, a, b)
+    out = []
+    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+        seg = "".join(b[j1:j2])
+        esc = html_mod.escape(seg)
+        out.append(esc if tag == "equal"
+                   else f'<mark class="mon-diff">{esc}</mark>')
+    return "".join(out)
+
+
+def _detail_rows(snaps, fields) -> list[dict]:
+    """一组字段的历史明细(最新在上):时间 + 每字段一列当时值 + 是否变化 + 变化内容。
+
+    单字段组:更新时间 | 值 | 是否有变化 | 变化内容(同旧版)。
+    多字段组(评价/状态/报价/文案):更新时间 | 字段A | 字段B | … | 是否有变化 | 变化内容。
+    任一字段变即算该行有变化;变化内容按字段前缀列出各字段的变化。
+    数字类字段变化内容留空(上下行"当时值"直接对比);文案类走词级 diff。
+    """
+    ordered = list(reversed(snaps))
+    rows = []
+    for i, s in enumerate(ordered):
+        prev = ordered[i + 1] if i + 1 < len(ordered) else None
+        row = {"time": (s.get("checked_at") or "")[5:16]}
+        any_chg = False
+        diffs = []
+        for key, lab, getter, fmt, kind in fields:
+            v = fmt(getter(s))
+            row[f"v_{key}"] = v
+            if prev is None:
+                continue
+            if _field_changed(getter, fmt, s, prev):
+                any_chg = True
+                if kind == "text":
+                    d = _word_diff(fmt(getter(prev)), v)
+                    if d != "—":
+                        seg = d if len(fields) == 1 else f"{lab}:{d}"
+                        diffs.append(seg)
+        if prev is None:
+            row["chg"] = _CHG_BASE
+            row["diff"] = '<span style="color:#cbd5e1">—</span>'
+        elif any_chg:
+            row["chg"] = _CHG_YES
+            body = "；".join(diffs)
+            row["diff"] = (f'<span style="color:#b45309;font-weight:600">{body}</span>'
+                           if body else '<span style="color:#cbd5e1">—</span>')
+        else:
+            row["chg"] = _CHG_NO
+            row["diff"] = '<span style="color:#cbd5e1">—</span>'
+        rows.append(row)
+    return rows
+
 
 @ui.page("/monitor")
 def page_monitor():
+    # 字段抽屉:q-drawer 属顶层布局元素,必须建在页面函数体(直接挂 client
+    # 的 q-layout,不随页面内容嵌套),内容在点击时重建。
+    with ui.drawer("right", value=False, bordered=True) as field_drawer:
+        # 宽度走 q-drawer 的 width prop(内联 style 会被组件自己的 style 覆盖);
+        # breakpoint 设超大值 → 任何屏宽下抽屉都是浮层(带遮罩),
+        # 不挤压主表,点遮罩即关
+        field_drawer.props("width=980 breakpoint=9999")
+        drawer_body = ui.column().classes("w-full gap-2 p-4")
+
+    def open_field_drawer(asin, domain, field_key="title"):
+        """点 ASIN 或任意矩阵格 → 右侧抽屉:纵向切卡(每字段一张)+ 明细表。"""
+        from monitor.baseline import current_baseline
+        snaps = monitor_store.snapshots_for(MONITOR_DB, asin, domain)
+        if not snaps:
+            ui.notify("暂无快照")
+            return
+        p = monitor_store.get_profile(MONITOR_DB, asin, domain) or {}
+        title = p.get("title") or asin
+        base = current_baseline(MONITOR_DB, asin, domain) or snaps[0]
+        cur = snaps[-1]
+        from monitor.board import _diff_line, _status_label, _has_unconfirmed
+        drawer_body.clear()
+        with drawer_body:
+            with ui.row().classes("w-full items-center justify-between"):
+                with ui.column().classes("gap-0"):
+                    html(f'<div class="card-title">{title}</div>'
+                         f'<div class="pg-meta">{asin} · {DOMAIN_SHORT(domain)} · '
+                         f'共 {len(snaps)} 次检查</div>')
+                ui.button(icon="close", on_click=field_drawer.hide) \
+                    .props("flat round dense")
+            html(f'<div class="pg-meta">基线 {(base.get("checked_at") or "")[5:16]} → '
+                 f'{(cur.get("checked_at") or "")[5:16]} · {_diff_line(base, cur)}</div>')
+            ui.separator()
+            # 操作区:原页面 / 确认基线 / 删除监控(放在切卡上方,不用滚到底)
+            with ui.row().classes("w-full items-center justify-between"):
+                if p.get("url"):
+                    ui.button("打开原页面",
+                              on_click=lambda u=p["url"]: ui.open(u, new_tab=True)) \
+                        .props("outline no-caps dense icon=open_in_new")
+                with ui.row().classes("items-center gap-2"):
+                    if _has_unconfirmed(MONITOR_DB, asin, domain):
+                        def _confirm():
+                            from monitor.pipeline import confirm_and_move_baseline
+                            confirm_and_move_baseline(MONITOR_DB, asin, domain)
+                            for an in monitor_store.unconfirmed_anomalies(
+                                    MONITOR_DB, limit=500):
+                                if an["asin"] == asin and an["domain"] == domain:
+                                    monitor_store.confirm_anomaly(MONITOR_DB, an["id"])
+                            field_drawer.hide()
+                            ui.notify("已确认,基线前移", type="positive")
+                            ui.navigate.reload()
+                        ui.button("确认无误 → 前移基线", on_click=_confirm) \
+                            .props("unelevated no-caps dense color=primary icon=verified")
+                    else:
+                        ui.label("当前无未确认异常").classes("pg-meta")
+
+                    def _delete():
+                        monitor_store.delete_profile(MONITOR_DB, asin, domain)
+                        field_drawer.hide()
+                        ui.notify(f"已删除监控 {asin}", type="positive")
+                        ui.navigate.reload()
+                    armed = {"ok": False}
+                    del_btn = ui.button("删除监控", icon="delete",
+                                        on_click=lambda: _del_click()) \
+                        .props("outline no-caps dense color=negative")
+
+                    def _del_click():
+                        if not armed["ok"]:
+                            armed["ok"] = True
+                            del_btn.set_text("再点一次确认删除")
+                            del_btn.props("unelevated")
+                        else:
+                            _delete()
+            # 纵向切卡:同类字段合并一张卡,明细表一字段一列并排
+            def _grp_fields(fkeys):
+                out = []
+                for fk in fkeys:
+                    k, lab, getter, fmt, kind = MON_BY_KEY[fk]
+                    if k == "status":  # 原始状态码 → 中文标签
+                        getter = lambda s: _status_label(s.get("status"))
+                        fmt = lambda v: v or "—"
+                    out.append((k, lab, getter, fmt, kind))
+                return out
+
+            with ui.row().classes("w-full items-stretch gap-3 no-wrap"):
+                with ui.tabs().props("vertical") as tabs:
+                    for gk, glab, _ in MON_GROUPS:
+                        ui.tab(gk, label=glab)
+                init_group = MON_FIELD_GROUP.get(field_key, "title")
+                with ui.tab_panels(tabs, value=init_group).classes("flex-grow min-w-0"):
+                    for gk, glab, fkeys in MON_GROUPS:
+                        with ui.tab_panel(gk):
+                            fields = _grp_fields(fkeys)
+                            val_cols = [{"headerName": lab, "field": f"v_{k}",
+                                         "minWidth": 110, "flex": 2}
+                                        for k, lab, _, _, _ in fields]
+                            detail = _detail_rows(snaps, fields)
+                            ui.aggrid({
+                                "columnDefs": [
+                                    {"headerName": "更新时间", "field": "time",
+                                     "width": 110},
+                                    *val_cols,
+                                    {"headerName": "是否有变化", "field": "chg",
+                                     "width": 96},
+                                    {"headerName": "变化内容", "field": "diff",
+                                     "minWidth": 170, "flex": 2},
+                                ],
+                                "rowData": detail,
+                                "rowHeight": 30,
+                                "defaultColDef": {"sortable": True, "resizable": True},
+                            }, html_columns=[1 + len(fields), 2 + len(fields)],
+                                auto_size_columns=False) \
+                                .classes("w-full ag-dense") \
+                                .style(f"height:{52 + 30 * min(max(len(detail), 10), 14)}px")
+                            # 表头34 + 每行30:默认至少露 10 行空间,快照多时到 14 行为止
+                            # 长文案字段:明细表下方空白区放最新全文,逐字段列出;
+                            # 与上一条快照对比,变了的词段标橙底
+                            prev_snap = snaps[-2] if len(snaps) >= 2 else None
+                            for k, lab, getter, fmt, kind in fields:
+                                if kind != "text":
+                                    continue
+                                val = str(fmt(getter(cur)))
+                                if len(val) <= 40:
+                                    continue  # 短值(上下架/BuyBox…)表里已完整
+                                if prev_snap is not None:
+                                    pv = str(fmt(getter(prev_snap)))
+                                    body = (_highlight_diff(pv, val)
+                                            if pv != val else
+                                            html_mod.escape(val).replace(chr(10), "<br>"))
+                                    tag = ("" if pv == val else
+                                           ' <span style="font-weight:400;'
+                                           f'color:#b45309">(橙底 = 较 '
+                                           f'{(prev_snap.get("checked_at") or "")[5:16]}'
+                                           ' 变化)</span>')
+                                else:
+                                    body = html_mod.escape(val).replace(chr(10), "<br>")
+                                    tag = ""
+                                html(f'<div class="mon-txt-label">{lab} · 最新全文 '
+                                     f'{(cur.get("checked_at") or "")[5:16]}{tag}</div>'
+                                     f'<div class="mon-txt-body">{body}</div>')
+        field_drawer.set_value(True)
+
     with build_shell("/monitor"):
 
         def refresh():
@@ -813,8 +1156,10 @@ def page_monitor():
                 html('<div class="pg-title">链接监控</div>')
                 summary = html('')
             with ui.row().classes("items-center gap-2"):
-                ui.button("跑一轮采集", icon="play_arrow",
-                          on_click=lambda: run_monitor_round(refresh)) \
+                btn_run = ui.button(
+                    "跑一轮采集",
+                    on_click=lambda: run_monitor_round(
+                        refresh, btn_run, prog, prog_text, prog_row)) \
                     .props("outline no-caps dense")
                 ui.button("添加监控", icon="add_link",
                           on_click=lambda: add_monitor_dialog(refresh)) \
@@ -823,10 +1168,43 @@ def page_monitor():
                     .props("outlined dense hide-bottom-space") \
                     .classes("w-64").style("font-size:13px")
 
+        # 采集进度条:平时隐藏,「跑一轮采集」时出现,完成后停留显示结果
+        prog_row = ui.row().classes("w-full items-center gap-3 mb-1")
+        with prog_row:
+            prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
+            prog_text = ui.label("").classes("pg-meta")
+        prog_row.set_visibility(False)
+
         # 国家切卡:全部 + IN/AU/US/JP/MX/BR,点某国只看该国,再点恢复全部
         cur = {"cc": "全部"}
         card_holder = ui.row().classes("w-full items-center gap-2 mb-2")
         grid_holder = ui.column().classes("w-full")
+        # 表格下方文案区:点行后展示该 ASIN 的标题 / BP / DP 全文
+        text_holder = ui.column().classes("w-full")
+
+        def show_text_panel(asin, domain):
+            snap = monitor_store.latest_snapshot(MONITOR_DB, asin, domain) or {}
+            text_holder.clear()
+            with text_holder:
+                with ui.card().classes("app-card w-full mt-2"):
+                    with ui.row().classes("w-full items-center justify-between"):
+                        html(f'<div class="card-title">文案 · {asin}'
+                             f' <span class="pg-meta">'
+                             f'{(snap.get("checked_at") or "")[5:16]}</span></div>')
+                        ui.button(icon="close",
+                                  on_click=text_holder.clear) \
+                            .props("flat round dense")
+                    html(f'<div class="mon-txt-block"><div class="mon-txt-label">'
+                         f'标题</div><div class="mon-txt-body">'
+                         f'{html_mod.escape(snap.get("title") or "—")}</div></div>')
+                    bl = snap.get("bullets") or []
+                    lis = "".join(f"<li>{html_mod.escape(b)}</li>" for b in bl) \
+                        or '<li style="color:#94a3b8">—</li>'
+                    html(f'<div class="mon-txt-block"><div class="mon-txt-label">'
+                         f'BP 五点</div><ul class="mon-txt-body">{lis}</ul></div>')
+                    html(f'<div class="mon-txt-block"><div class="mon-txt-label">'
+                         f'DP 描述</div><div class="mon-txt-body">'
+                         f'{html_mod.escape(snap.get("description") or "—")}</div></div>')
         CC_ORDER = ["全部", "IN", "AU", "US", "JP", "MX", "BR"]
 
         def pick(cc):
@@ -835,7 +1213,6 @@ def page_monitor():
             rebuild()
 
         def rebuild():
-            from monitor.board import _table_row  # 复用行构造(含上次对比+异常徽标)
             # 每次都重取:跑完一轮采集 / 添加链接 / 确认基线后,卡片与表格都是最新
             data_now = monitor_board.get_board_data(MONITOR_DB)
             counts = {}
@@ -869,66 +1246,68 @@ def page_monitor():
             for (asin, domain), snap in data_now["latest"].items():
                 if cur["cc"] != "全部" and DOMAIN_SHORT(domain) != cur["cc"]:
                     continue
-                row = _table_row(MONITOR_DB, asin, domain, snap, anom_by_key)
-                if q.value and q.value.lower() not in json.dumps(
-                        {k: str(v) for k, v in row.items()}).lower():
+                row = _matrix_row(MONITOR_DB, asin, domain, snap, anom_by_key)
+                hay = (row["_asin"] + " " + row["_title"] + " "
+                       + (row["_url"] or "")).lower()
+                if q.value and q.value.lower() not in hay:
                     continue
                 rows.append(row)
             rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
             summary.set_content(
                 f'<div class="pg-meta">监控 {data_now["total"]} 条 · 异常 '
-                f'{data_now["abnormal_count"]} 条 · 当前显示 {len(rows)} 条</div>')
+                f'{data_now["abnormal_count"]} 条 · 当前显示 {len(rows)} 条 · '
+                f'点 ASIN 或任意格看字段明细,点「产品」看文案全文</div>')
             grid_holder.clear()
             with grid_holder:
                 make_grid(rows)
+            text_holder.clear()   # 换筛选/重采后旧的文案区不再对应,清掉
 
         def make_grid(rows):
-            def _label(badge: str):
-                for key in ("🚨", "⚠", "ℹ"):
-                    if badge.startswith(key):
-                        sev_cls = {"🚨": "bg-[#fee2e2] text-[#b91c1c]",
-                                   "⚠": "bg-[#fef3c7] text-[#b45309]",
-                                   "ℹ": "bg-[#dbeafe] text-[#1d4ed8]"}[key]
-                        return badge, sev_cls
-                return badge, "bg-[#dcfce7] text-[#15803d]"
-
-            # monitor 侧的中文状态标签 → 我们的药丸映射(两套词表统一)
-            zh_to_key = {"正常": "alive", "已删": "deleted", "被拦截": "blocked",
-                         "下架": "deleted", "登录失效": "login_expired",
-                         "未知": "unknown"}
-            g_rows = []
-            for r in rows:
-                badge, cls = _label(r["异常"])
-                g_rows.append({
-                    "anomaly_html": (f'<span class="pill {cls}">{badge}</span>'
-                                     if badge != "正常" else
-                                     '<span style="color:#15803d;font-weight:600">正常</span>'),
-                    "status_html": status_text(zh_to_key.get(r["状态"], "unknown")),
-                    "asin": r["ASIN"], "title": r["标题"],
-                    "price": r["价格"], "rating": r["评分"], "rc": r["评价数"],
-                    "buybox": r["BuyBox"], "avail": r["上下架"], "last": r["上次"],
-                    "ts": r["跟踪时间"], "_asin": r["_asin"], "_domain": r["_domain"],
-                })
+            # 变化矩阵:ASIN | 最后更新 | 异常 | 每字段(有更新/无变化) | 产品
+            # 全部行平铺直接显示;排序保持异常在前(rebuild 已按 _sev/_ts 排好)
+            col_defs = [
+                # ASIN 不 pinned:agGrid 只在主区触发 cellClicked,
+                # 钉住的格子点了不会开抽屉
+                # 宽度留足:ASIN 10-11 位等宽粗体、时间 "MM-DD HH:MM" 12 字符,
+                # 都要容得下完整内容 + 单元格左右内边距,不能被省略号截断
+                {"headerName": "ASIN", "field": "asin_html", "width": 170},
+                {"headerName": "最后更新", "field": "ts", "width": 132},
+                {"headerName": "异常", "field": "anomaly_html", "width": 118},
+            ] + [
+                {"headerName": lab, "field": f"chg_{key}", "width": 74,
+                 "sortable": False, "cellClass": "mon-mtx",
+                 "headerClass": "mon-mtx"}
+                for key, lab, _, _, _ in MON_FIELDS
+            ] + [
+                {"headerName": "产品", "field": "title", "minWidth": 160, "flex": 1},
+            ]
+            html_cols = [0, 2] + [3 + i for i in range(len(MON_FIELDS))]
+            # 高度随行数走:表头 34 + 每行 30,不再用 ag-fill 撑满屏高,
+            # 否则行少时表格下方一大片空白,文案区被推到屏幕外
             g = ui.aggrid({
-                "columnDefs": [
-                    {"headerName": "状态", "field": "status_html", "width": 80, "pinned": "left"},
-                    {"headerName": "ASIN", "field": "asin", "width": 110, "pinned": "left"},
-                    {"headerName": "异常", "field": "anomaly_html", "width": 110},
-                    {"headerName": "标题", "field": "title", "minWidth": 180, "flex": 3},
-                    {"headerName": "价格", "field": "price", "width": 90},
-                    {"headerName": "评分", "field": "rating", "width": 64},
-                    {"headerName": "评价数", "field": "rc", "width": 72},
-                    {"headerName": "BuyBox", "field": "buybox", "width": 100},
-                    {"headerName": "上下架", "field": "avail", "width": 90},
-                    {"headerName": "上次", "field": "last", "minWidth": 120, "flex": 2},
-                    {"headerName": "跟踪时间", "field": "ts", "width": 96},
-                ],
-                "rowData": g_rows,
+                "columnDefs": col_defs,
+                "rowData": rows,
                 "defaultColDef": {"sortable": True, "resizable": True},
                 "rowHeight": 30,
-            }, html_columns=[0, 2]).classes("w-full ag-dense ag-fill")
-            g.on("cellClicked", lambda e: history_dialog(
-                MONITOR_DB, e.args["data"]["_asin"], e.args["data"]["_domain"]))
+            }, html_columns=html_cols, auto_size_columns=False) \
+                .classes("w-full ag-dense") \
+                .style(f"height:{min(34 + 30 * (len(rows) + 1), 640)}px")
+
+            def _click(e):
+                data = e.args.get("data") or {}
+                if not data.get("_asin"):
+                    return
+                col = e.args.get("colId") or ""
+                if col == "title":
+                    # 点「产品」文字列 → 表格下方文案区看标题/BP/DP 全文
+                    show_text_panel(data["_asin"], data["_domain"])
+                    return
+                # 点中哪个字段列,抽屉就默认打开哪个切卡
+                key = col.replace("chg_", "")
+                if key not in MON_FIELD_LABELS:
+                    key = "title"
+                open_field_drawer(data["_asin"], data["_domain"], key)
+            g.on("cellClicked", _click)
 
         q.on("keydown", lambda e: rebuild() if e.args.get("key") == "Enter" else None)
         rebuild()
@@ -984,10 +1363,18 @@ def add_monitor_dialog(on_done):
     d.open()
 
 
-def run_monitor_round(on_done):
-    """跑一轮采集:真实抓取 profiles 里启用的 ASIN,进度与结果用通知反馈。"""
+def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
+    """跑一轮采集:真实抓取 profiles 里启用的 ASIN,按站点并行。
+
+    交互:按钮进入 loading → 页内进度条按站点粒度推进(显示各站点进行中)
+    → 完成后进度条报告结果并自动刷新表格;全程不弹窗不跳页。
+
+    控件句柄由 page_monitor 传入(本函数是模块级,拿不到页面局部变量)。
+    工作线程只写共享 dict,UI 更新统一由 0.2s 的 ui.timer 拉取,
+    避免跨线程直接操作元素。返回协程交给 NiceGUI 调度。
+    """
     from monitor import store as ms
-    from monitor.pipeline import run_round
+    from monitor.pipeline import run_round_parallel
     from monitor.address import PlaywrightAdapter
 
     profs = ms.list_profiles(MONITOR_DB)
@@ -996,96 +1383,67 @@ def run_monitor_round(on_done):
         return
 
     async def _run():
-        domains = sorted({p["domain"] for p in profs})
-        notify = ui.notify(f"开始采集:{len(profs)} 条链接、{len(domains)} 个站点…",
-                           type="ongoing", timeout=None)
+        enabled = [p for p in profs if p.get("monitor_enabled", 1)]
+        domains = sorted({p["domain"] for p in enabled})
+        total = len(enabled)
+
+        state = {"done": 0, "anom": 0, "line": f"准备并行采集 {total} 条 / {len(domains)} 站…",
+                 "finished": False, "error": ""}
+
+        btn.props("disable loading")
+        prog_row.set_visibility(True)
+        prog.set_value(0)
+        prog_text.set_text(state["line"])
+
+        def on_progress(done, tot, domain, profile):
+            # 每站点完成一条回调一次(工作线程):只写 state,不碰 UI
+            state["done"] = done
+            label = (profile.get("title") or "")[:20] or profile["asin"]
+            state["line"] = (
+                f"[{done}/{tot}] {DOMAIN_SHORT(domain)} · "
+                f"{profile['asin']} {label}"
+                + (f" · 异常 {state['anom']}" if state["anom"] else ""))
 
         def _work():
-            results = {}
-            for dom in domains:
-                dom_profs = [p for p in profs if p["domain"] == dom
-                             and p.get("monitor_enabled", 1)]
-                if not dom_profs:
-                    continue
-                adapter = PlaywrightAdapter(dom)
-                try:
-                    results[dom] = run_round(MONITOR_DB, adapter, profiles=dom_profs)
-                finally:
-                    adapter.close()
-            return results
+            r = run_round_parallel(
+                MONITOR_DB, lambda dom: PlaywrightAdapter(dom),
+                profiles=profs, on_progress=on_progress)
+            state["anom"] = r["anomalies"]
+            return r["checked"]
+
+        async def _poll():
+            # 工作线程只改 state;这里负责把它画到屏幕上
+            prog.set_value(state["done"] / total if total else 1)
+            prog_text.set_text(state["line"])
+            if state["finished"]:
+                timer.cancel()
+                if state["error"]:
+                    prog_text.set_text(
+                        f'<span style="color:#b91c1c">采集失败:{state["error"]}</span>')
+                    ui.notify(f"采集失败:{state['error']}", type="negative")
+                else:
+                    color = "#b45309" if state["anom"] else "#15803d"
+                    prog_text.set_text(
+                        f'<span style="color:{color};font-weight:600">'
+                        f'采集完成 {state["done"]} 条 · 异常 {state["anom"]} 条</span>')
+                    ui.notify(f"采集完成:{state['done']} 条,"
+                              f"发现异常 {state['anom']} 条",
+                              type="warning" if state["anom"] else "positive")
+                btn.props(remove="disable loading")
+                on_done()  # 重建表格与切卡(不跳页,筛选状态保留)
+
+        timer = ui.timer(0.2, _poll)
 
         try:
-            res = await run.io_bound(_work)
-            checked = sum(r["checked"] for r in res.values())
-            anomalies = sum(r["anomalies"] for r in res.values())
-            notify.dismiss()
-            ui.notify(f"采集完成:{checked} 条,发现异常 {anomalies} 条",
-                      type="warning" if anomalies else "positive")
+            await run.io_bound(_work)
         except Exception as e:
-            notify.dismiss()
-            ui.notify(f"采集失败:{e.__class__.__name__}: {e}", type="negative")
-        on_done()
+            state["error"] = f"{e.__class__.__name__}: {e}"
+        finally:
+            state["finished"] = True
 
-    _run()
+    return _run()
 
 
-def history_dialog(db_path, asin, domain):
-    """监控行点选 → 变化史弹窗(复用 board 的快照与基线逻辑)。"""
-    from monitor import store as ms
-    from monitor.baseline import current_baseline
-    snaps = ms.snapshots_for(db_path, asin, domain)
-    if not snaps:
-        ui.notify("暂无快照")
-        return
-    base = current_baseline(db_path, asin, domain)
-    p = ms.get_profile(db_path, asin, domain)
-    title = (p or {}).get("title", asin)
-    with ui.dialog() as d, ui.card().classes("app-card w-[720px]"):
-        with ui.row().classes("w-full items-center justify-between"):
-            html(f'<div class="card-title">{title} · {asin}</div>')
-            ui.button(icon="close", on_click=d.close).props("flat round dense")
-        b = base or snaps[0]
-        cur = snaps[-1]
-        from monitor.board import _diff_line
-        html(f'<div class="pg-meta">基线 {(b.get("checked_at") or "")[5:16]} → '
-                f'{(cur.get("checked_at") or "")[5:16]} · {_diff_line(b, cur)}</div>')
-        ui.separator()
-        html('<b style="font-size:13px">变化史(历次快照)</b>')
-        rows = [{
-            "time": (s.get("checked_at") or "")[5:16],
-            "status": s.get("status"),
-            "price": s.get("price") or "—",
-            "bad": (s.get("home_reviews") or {}).get("recent_bad", 0),
-        } for s in reversed(snaps)]
-        ui.aggrid({
-            "columnDefs": [
-                {"headerName": "时间", "field": "time", "width": 110},
-                {"headerName": "状态", "field": "status", "width": 90},
-                {"headerName": "价格", "field": "price", "width": 110},
-                {"headerName": "新增差评", "field": "bad", "width": 90},
-            ],
-            "rowData": rows, "rowHeight": 28,
-        }).classes("w-full ag-dense")
-        with ui.row():
-            if p and p.get("url"):
-                ui.button("打开原页面", on_click=lambda: ui.open(p["url"], new_tab=True)) \
-                    .props("outline no-caps dense icon=open_in_new")
-            from monitor.board import _has_unconfirmed
-            if _has_unconfirmed(db_path, asin, domain):
-                def _confirm():
-                    from monitor.pipeline import confirm_and_move_baseline
-                    confirm_and_move_baseline(db_path, asin, domain)
-                    for an in ms.unconfirmed_anomalies(db_path, limit=500):
-                        if an["asin"] == asin and an["domain"] == domain:
-                            ms.confirm_anomaly(db_path, an["id"])
-                    d.close()
-                    ui.notify("已确认,基线前移", type="positive")
-                    ui.navigate.to("/monitor")
-                ui.button("确认无误 → 前移基线", on_click=_confirm) \
-                    .props("unelevated no-caps dense color=primary icon=verified")
-            else:
-                ui.label("该链路当前无未确认异常").classes("pg-meta")
-    d.open()
 
 
 # ---------- 弹窗:登录 / IP 热度 / 系统维护 ----------

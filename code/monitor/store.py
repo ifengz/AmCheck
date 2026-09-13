@@ -50,7 +50,10 @@ def init_db(path: Path = DEFAULT_DB) -> None:
                 variations TEXT DEFAULT '[]',
                 price TEXT, price_value REAL, currency TEXT,
                 rating REAL, review_count INTEGER, bsr INTEGER,
+                bsr_cat TEXT DEFAULT '', bsr_sub TEXT DEFAULT '',
                 deal_tag TEXT, availability TEXT, status TEXT,
+                bullets TEXT DEFAULT '[]',
+                description TEXT DEFAULT '',
                 home_reviews TEXT DEFAULT '{}',
                 note TEXT
             )""")
@@ -58,6 +61,17 @@ def init_db(path: Path = DEFAULT_DB) -> None:
                      "ON snapshots (asin, domain, checked_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS ix_snap_time "
                      "ON snapshots (checked_at)")
+        # 旧库补列:bullets/description 是后加的采集字段;
+        # bsr_cat/bsr_sub = BSR 大类/小类名(如 Home / Desk Lamps)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(snapshots)")}
+        if "bullets" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN bullets TEXT DEFAULT '[]'")
+        if "description" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN description TEXT DEFAULT ''")
+        if "bsr_cat" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN bsr_cat TEXT DEFAULT ''")
+        if "bsr_sub" not in cols:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN bsr_sub TEXT DEFAULT ''")
 
         # 检测出的异常(用于去重/通知/已读)
         conn.execute("""
@@ -117,6 +131,17 @@ def get_profile(path: Path, asin: str, domain: str) -> dict | None:
         return d
 
 
+def delete_profile(path: Path, asin: str, domain: str) -> None:
+    """彻底移除一条监控:profile 连同它的全部快照与异常。"""
+    with _connect(path) as conn:
+        conn.execute("DELETE FROM snapshots WHERE asin=? AND domain=?",
+                     (asin, domain))
+        conn.execute("DELETE FROM anomalies WHERE asin=? AND domain=?",
+                     (asin, domain))
+        conn.execute("DELETE FROM profiles WHERE asin=? AND domain=?",
+                     (asin, domain))
+
+
 def list_profiles(path: Path, only_enabled: bool = True) -> list[dict]:
     import json
     where = "WHERE monitor_enabled = 1" if only_enabled else ""
@@ -156,15 +181,19 @@ def insert_snapshot(path: Path, snap: SnapshotRecord) -> int:
         cur = conn.execute("""
             INSERT INTO snapshots (asin, domain, checked_at, title, image_url,
                 buybox, parent_asin, variations, price, price_value, currency,
-                rating, review_count, bsr, deal_tag, availability, status,
-                home_reviews, note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                rating, review_count, bsr, bsr_cat, bsr_sub,
+                deal_tag, availability, status,
+                bullets, description, home_reviews, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 snap.asin, snap.domain, snap.checked_at, snap.title,
                 snap.image_url, snap.buybox, snap.parent_asin,
                 json.dumps(snap.variations or []), snap.price, snap.price_value,
                 snap.currency, snap.rating, snap.review_count, snap.bsr,
+                snap.bsr_cat or "", snap.bsr_sub or "",
                 snap.deal_tag, snap.availability, snap.status,
+                json.dumps(snap.bullets or [], ensure_ascii=False),
+                (snap.description or "")[:4000],
                 json.dumps(snap.home_reviews or {}), snap.note,
             ))
         return cur.lastrowid
@@ -191,6 +220,7 @@ def snapshots_for(path: Path, asin: str, domain: str,
     for r in rows:
         d = dict(r)
         d["variations"] = json.loads(d.get("variations") or "[]")
+        d["bullets"] = json.loads(d.get("bullets") or "[]")
         d["home_reviews"] = json.loads(d.get("home_reviews") or "{}")
         out.append(d)
     if limit:

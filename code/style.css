@@ -54,6 +54,8 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
   padding: 5px 12px;}
 .kpi-num {font-size: 17px; font-weight: 700; line-height: 1.2;}
 .kpi-tag {font-size: 12px; color: var(--ink-sub);}
+/* 数字和标签直接相邻时(不在 kpi-inline 容器里)拉开间隙,如国家切卡 */
+.kpi-num + .kpi-tag {margin-left: 6px;}
 
 /* 药丸徽标 */
 .pill {display: inline-block; padding: 1px 8px; border-radius: 999px;
@@ -98,6 +100,35 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 /* 弹窗 */
 .q-dialog__inner > .q-card {border-radius: 12px;
   box-shadow: 0 25px 50px -12px rgba(0,0,0,.25);}
+
+/* 监控变化矩阵:字段列内容居中,表头也居中 */
+.ag-dense .mon-mtx {text-align: center; display: flex; align-items: center;
+  justify-content: center;}
+.ag-dense .ag-header-cell.mon-mtx .ag-header-cell-text {text-align: center;}
+
+/* ASIN 列缩略图:26px 主图,一眼分清产品;无图给灰底占位 */
+.asin-cell {display: flex; align-items: center; gap: 8px;}
+.asin-thumb {width: 26px; height: 26px; object-fit: contain; border-radius: 4px;
+  background: #f1f5f9; flex: none;}
+.asin-thumb-none {border: 1px dashed #cbd5e1;}
+
+/* 字段抽屉:纵向切卡(左列字段名,窄一些,13px) */
+.mon-drawer .q-tab--vertical {min-width: 92px;}
+.mon-drawer .q-tab__label {font-size: 13px;}
+.mon-drawer .q-tab-panels {background: transparent; padding: 0;}
+
+/* 监控页表格下方文案区:标题/BP/DP 全文,不截断 */
+.mon-txt-block {margin-top: 8px;}
+.mon-txt-block:first-child {margin-top: 0;}
+.mon-txt-label {font-size: 11px; font-weight: 700; color: var(--ink-sub);
+  letter-spacing: .5px; margin-bottom: 2px;}
+.mon-txt-body {font-size: 13px; color: var(--ink); line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;}
+.mon-txt-body ul {margin: 0; padding-left: 18px; list-style: disc;}
+.mon-txt-body li {margin: 2px 0;}
+/* 全文区变化词段:橙底高亮 */
+.mon-txt-body mark.mon-diff {background: #ffedd5; color: #b45309;
+  font-weight: 600; border-radius: 2px; padding: 0 1px;}
 
 /* 进度条 */
 .q-linear-progress {border-radius: 999px;}

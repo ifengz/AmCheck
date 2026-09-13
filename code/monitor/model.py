@@ -67,9 +67,13 @@ class SnapshotRecord:
     rating: float | None = None
     review_count: int | None = None
     bsr: int | None = None                                 # Best Sellers Rank
+    bsr_cat: str = ""                                      # BSR 大类名,如 "Home"
+    bsr_sub: str = ""                                      # BSR 小类名,如 "Desk Lamps"
     deal_tag: str = ""                                     # Lightning Deal / Deal of the Day
     availability: str = ""                                 # In Stock / Currently unavailable
     status: str = "alive"                                  # alive/deleted/blocked/unavailable
+    bullets: list = field(default_factory=list)            # 五点描述(BP)原文列表
+    description: str = ""                                  # 产品描述(DP)纯文本,截断存储
     home_reviews: dict = field(default_factory=dict)       # {"recent_bad": int, "stars_breakdown": {...}}
     note: str = ""
     id: int | None = None
@@ -87,9 +91,12 @@ class SnapshotRecord:
             price=d.get("price", ""), price_value=d.get("price_value"),
             currency=d.get("currency", ""), rating=d.get("rating"),
             review_count=d.get("review_count"), bsr=d.get("bsr"),
+            bsr_cat=d.get("bsr_cat", ""), bsr_sub=d.get("bsr_sub", ""),
             deal_tag=d.get("deal_tag", ""),
             availability=d.get("availability", ""),
             status=d.get("status", "alive"),
+            bullets=d.get("bullets") or [],
+            description=d.get("description", ""),
             home_reviews=d.get("home_reviews") or {},
             note=d.get("note", ""), id=d.get("id"),
         )

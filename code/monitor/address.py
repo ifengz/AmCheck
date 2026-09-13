@@ -70,6 +70,12 @@ def snapshot_for_step(asin: str, domain: str, url: str = "",
     price, rating, rc, buybox, avail, deal = (
         base_price, 4.4, 12847, "Amazon.com", "In Stock", "")
     status, home_bad = "alive", 0
+    # BP/DP 演示:step 3 起改一条卖点文案、换 deal 标签(文案类变化演示)
+    bullets = [f"Bullet {i+1} for {asin}" for i in range(5)]
+    description = f"High quality demo product {asin}. Multi-language packaging included."
+    if step >= 3:
+        bullets[2] = f"Bullet 3 UPDATED for {asin} — new wording"
+        description = description.replace("High quality", "Premium quality")
 
     if step >= 6:
         status, avail, price, rating, rc = "unavailable", "Currently unavailable", 0.0, 0.0, 0
@@ -84,6 +90,11 @@ def snapshot_for_step(asin: str, domain: str, url: str = "",
     elif step == 1:
         price = round(base_price * 0.88, 2)    # 价格 -12%
 
+    # BSR 大类/小类:按 ASIN 稳定生成,演示字段随排名一起看
+    _cats = [("Home & Kitchen", "Desk Lamps"), ("Electronics", "Headphones"),
+             ("Kitchen & Dining", "Blenders"), ("Tools & Home", "Power Tools")]
+    bsr_cat, bsr_sub = _cats[int(abs(hash(asin)) % len(_cats))]
+
     return SnapshotRecord(
         asin=asin, domain=domain,
         checked_at=now_str(),
@@ -92,7 +103,10 @@ def snapshot_for_step(asin: str, domain: str, url: str = "",
         price_value=price or None, currency=currency,
         rating=rating or None, review_count=rc or None,
         bsr=1000 + int(abs(hash(asin)) % 90000) if status == "alive" else None,
+        bsr_cat=bsr_cat if status == "alive" else "",
+        bsr_sub=bsr_sub if status == "alive" else "",
         deal_tag=deal, availability=avail, status=status,
+        bullets=bullets, description=description,
         home_reviews={"recent_bad": home_bad, "stars_breakdown": {}},
         note="",
     )
@@ -210,6 +224,21 @@ class PlaywrightAdapter(BaseAdapter):
             if t and t.lower() not in ("amazon.in", "amazon"):
                 title = t.strip()
 
+        # 主图:优先 #landingImage 的 data-a-dynamic-image(取一张),
+        # 退化到 src;再不行扫图片区首张。只存 URL,不下载。
+        image_url = ""
+        img = page.query_selector("#landingImage, #imgTagWrapperId img, #altImages img")
+        if img:
+            dyn = img.get_attribute("data-a-dynamic-image") or ""
+            m = re.search(r'"(https?://[^"]+)"', dyn)
+            if m:
+                image_url = m.group(1)
+            else:
+                image_url = (img.get_attribute("src")
+                             or img.get_attribute("data-old-hires") or "")
+        if image_url.startswith("http") is False:
+            image_url = ""
+
         price_text, price_val, currency = _extract_price(page)
 
         rating = None
@@ -229,27 +258,31 @@ class PlaywrightAdapter(BaseAdapter):
                 review_count = int(m.group(1).replace(",", ""))
 
         buybox = ""
-        sold = page.query_selector(
-            "#sellerProfileTriggerId, #merchantInfoFeature_feature_div, "
-            "div#buyboxRightColumn, #desktop_buybox")
-        if sold:
-            txt = _clean(sold.inner_text())
-            # 先切掉买盒尾部的噪声("Payment / Gift / Add to Wish List / See more")
-            for _cut in ("Payment", "Gift options", "Add to", "Secure", "Available at", "See more"):
-                idx = txt.find(_cut)
-                if idx > 0:
-                    txt = txt[:idx]
-                    break
-            # BuyBox 归属 = "Sold by" 的卖家(谁持有 BuyBox),"Ships from" 只是履约方
-            m = re.search(r"Sold by\s*([A-Za-z0-9][^\s]{0,60})", txt)
-            if m:
-                buybox = m.group(1).strip()
-            else:
-                m = re.search(r"Ships from\s*([A-Za-z0-9][^\s]{0,60})", txt)
+        # 优先:第三方卖家链接(直接就是卖家名);其次 Sold by 正则;再次自营标识。
+        # 全部落空则留空(空 = 无 BuyBox/未识别,好过存整块噪声文本)
+        el = page.query_selector("#sellerProfileTriggerId")
+        if el:
+            buybox = _clean(el.inner_text())[:60]
+        if not buybox:
+            sold = page.query_selector(
+                "#merchantInfoFeature_feature_div, div#buyboxRightColumn, #desktop_buybox")
+            if sold:
+                txt = _clean(sold.inner_text())
+                for _cut in ("Payment", "Gift options", "Add to", "Secure",
+                             "Available at", "See more", "FREE delivery"):
+                    idx = txt.find(_cut)
+                    if idx > 0:
+                        txt = txt[:idx]
+                        break
+                m = re.search(r"Sold by\s*([A-Za-z0-9][^\s]{0,60})", txt)
                 if m:
                     buybox = m.group(1).strip()
                 else:
-                    buybox = txt[:80]
+                    m = re.search(r"Ships from\s*([A-Za-z0-9][^\s]{0,60})", txt)
+                    if m:
+                        buybox = m.group(1).strip()
+                    elif "Amazon" in txt[:120]:
+                        buybox = "Amazon"   # 自营(无独立卖家链接时的兜底)
 
         availability = ""
         el = page.query_selector("#availability, #availability span")
@@ -257,16 +290,35 @@ class PlaywrightAdapter(BaseAdapter):
             availability = _clean(el.inner_text())
 
         deal_tag = ""
-        for sel in ('.dealBadge, #dealBadge, .lightsOutBadge, .aok-relative .a-color-secondary',
-                    'span:has-text("Lightning Deal"), span:has-text("Deal of the Day")'):
+        # 只认明确的促销徽标;去掉 .a-color-secondary(会误抓"Color: Blue"这类变体标签)
+        for sel in ('.dealBadgeText, #dealBadge, .lbBadgeText, .pctOffBadge',
+                    'span:has-text("Lightning Deal"), span:has-text("Deal of the Day"), '
+                    '.ag-coupon-badge'):
             el = page.query_selector(sel)
             if el:
-                txt = _clean(el.inner_text())
-                if txt and "M.R.P" not in txt:
+                try:
+                    txt = _clean(el.inner_text())
+                except Exception:
+                    txt = ""
+                if txt and "M.R.P" not in txt and "Color" not in txt:
                     deal_tag = txt[:40]
+                    break
+        # "Limited time deal" 无固定 class:限定在价格区找,避免匹配推荐位商品名
+        if not deal_tag:
+            for sel in ('#apex_desktop', '#corePrice_feature_div'):
+                el = page.query_selector(sel)
+                if not el:
+                    continue
+                try:
+                    txt = _clean(el.inner_text())
+                except Exception:
+                    txt = ""
+                if "Limited time deal" in txt:
+                    deal_tag = "Limited time deal"
                     break
 
         bsr = None
+        bsr_cat = bsr_sub = ""
         # BSR 常在详情折叠区:多种形态都试一遍
         for sel in ('tr:has-text("Best Sellers Rank")',
                     '#productDetails_db_sections',
@@ -281,22 +333,82 @@ class PlaywrightAdapter(BaseAdapter):
             m = re.search(r"#([\d,]+)", txt)
             if m:
                 bsr = int(m.group(1).replace(",", ""))
-                break
-            m = re.search(r"Best Sellers Rank[:\s]*#?\s*([\d,]+)", txt)
-            if m:
-                bsr = int(m.group(1).replace(",", ""))
+            else:
+                m = re.search(r"Best Sellers Rank[:\s]*#?\s*([\d,]+)", txt)
+                if m:
+                    bsr = int(m.group(1).replace(",", ""))
+            if bsr is not None:
+                # 大类: "#1,234 in Home & Kitchen";小类: "#5 in Desk Lamps"
+                cats = re.findall(r"#\s*[\d,]+\s+in\s+([\w&,\'’()\.\- ]+?)(?=[(·\n]|$)", txt)
+                if cats:
+                    bsr_cat = cats[0].strip()
+                if len(cats) > 1:
+                    bsr_sub = cats[1].strip()
                 break
 
+        # 变体:只认页面变体选择区(twister / variantBlock)里的 /dp/ 链接。
+        # 不扫全页评论链接——那是推荐位,每拍随机,会造成"变体"假异常。
         parent_asin = ""
-        variations = []
-        for a in page.query_selector_all("a[href*='/gp/aw/ol/'], a[href*='/product-reviews/']"):
-            href = a.get_attribute("href") or ""
-            m = re.search(r"(?:product-reviews|gp/aw/ol)/([A-Z0-9]{10})", href)
-            if m and m.group(1) != asin:
-                if m.group(1) not in variations:
-                    variations.append(m.group(1))
-                    if not parent_asin:
-                        parent_asin = m.group(1)
+        variations = set()
+        for sel in ('#twister', '#variant_enhancement_text_feature_div',
+                    '[id^="variation_"]', '#inline-twister-expanded-variation-strings-app'):
+            root = page.query_selector(sel)
+            if not root:
+                continue
+            for a in root.query_selector_all("a[href*='/dp/']"):
+                href = a.get_attribute("href") or ""
+                m = re.search(r"/dp/([A-Z0-9]{10})", href)
+                if m and m.group(1) != asin:
+                    variations.add(m.group(1))
+            if variations:
+                break
+        variations = sorted(variations)
+
+        # 五点描述(BP):#feature-bullets 下的 li;部分站点渲染在
+        # #aplus_feature-bullets / .feature-bullets,逐个尝试取首个非空
+        bullets = []
+        for sel in ('#feature-bullets ul li', '#feature-bullets li',
+                    'div[id^="featurebullets_feature_div"] li',
+                    '.feature-bullets li'):
+            for li in page.query_selector_all(sel):
+                try:
+                    t = _clean(li.inner_text())
+                except Exception:
+                    t = ""
+                # 过滤"缺少产品信息"占位与举报链接噪声
+                if t and len(t) > 2 and "report" not in t.lower() \
+                        and "缺少" not in t and "missing" not in t.lower():
+                    bullets.append(t[:300])
+            if bullets:
+                break
+
+        # 产品描述(DP):优先 #productDescription;A+ 图文页没有它,
+        # 退而取 aplus 区的通用文本段(只取文字,图片本来就读不到)
+        description = ""
+        el = page.query_selector("#productDescription")
+        if el:
+            try:
+                description = _clean(el.inner_text())[:4000]
+            except Exception:
+                description = ""
+        if not description:
+            for sel in ('#aplus', '#aplus_feature_div', '#aplus_v2_feature_div'):
+                el = page.query_selector(sel)
+                if not el:
+                    continue
+                texts = []
+                for sub in el.query_selector_all(
+                        'h2, h4, .aplus-divider__text, .aplus-normal__text, '
+                        '.aplus-v2-product-description-content, p'):
+                    try:
+                        t = _clean(sub.inner_text())
+                    except Exception:
+                        t = ""
+                    if 4 < len(t) < 500:
+                        texts.append(t)
+                if texts:
+                    description = " ⏎ ".join(texts)[:4000]
+                    break
 
         status = "alive"
         body = ""
@@ -312,11 +424,14 @@ class PlaywrightAdapter(BaseAdapter):
 
         return SnapshotRecord(
             asin=asin, domain=domain, checked_at=now_str(),
-            title=title, buybox=buybox, parent_asin=parent_asin,
+            title=title, image_url=image_url, buybox=buybox,
+            parent_asin=parent_asin,
             variations=variations, price=price_text, price_value=price_val,
             currency=currency, rating=rating, review_count=review_count,
-            bsr=bsr, deal_tag=deal_tag, availability=availability,
-            status=status, home_reviews={}, note="",
+            bsr=bsr, bsr_cat=bsr_cat, bsr_sub=bsr_sub,
+            deal_tag=deal_tag, availability=availability,
+            status=status, bullets=bullets, description=description,
+            home_reviews={}, note="",
         )
 
     def _fetch_home_reviews(self, page, asin, domain, snap) -> None:

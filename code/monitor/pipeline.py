@@ -9,6 +9,9 @@ BaseAdapter.fetch 返回 SnapshotRecord。
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 from .address import BaseAdapter, now_str
 from .baseline import current_baseline, ensure_baseline
 from .model import default_metric_config
@@ -16,11 +19,13 @@ from . import store
 from .rules import detect_snapshot
 
 
-def run_round(db_path, adapter: BaseAdapter, profiles=None) -> dict:
+def run_round(db_path, adapter: BaseAdapter, profiles=None,
+              on_item=None) -> dict:
     """跑一轮:对每个 profile 采集一次、判定、写 snapshots 与 anomalies。
 
     返回 {"checked": n, "anomalies": n},供看板/调度展示。
     用 mock 适配器时,adapter.fetch 每次返回不同"拍",天然造历史。
+    on_item(profile, checked, anomalies) 在每条处理完后回调(进度展示用)。
     """
     store.init_db(db_path)
     profs = profiles if profiles is not None else store.list_profiles(db_path)
@@ -52,8 +57,54 @@ def run_round(db_path, adapter: BaseAdapter, profiles=None) -> dict:
         for a in det:
             store.insert_anomaly(db_path, a)
             anomalies += 1
+        if on_item:
+            on_item(p, 1, len(det))
 
     return {"checked": checked, "anomalies": anomalies}
+
+
+def run_round_parallel(db_path, adapter_factory, profiles=None,
+                       on_progress=None, max_workers: int = 6) -> dict:
+    """按站点并行跑一轮:每站点一个适配器(独立浏览器),站点间互不阻塞。
+
+    adapter_factory(domain) → BaseAdapter,由调用方决定真实/模拟。
+    on_progress(done, total, domain, profile) 在每条完成后回调(UI 进度用;
+    回调在工作线程触发,自己保证线程安全——UI 侧只改共享 dict)。
+    SQLite 写路径每条独立短事务,并发安全;站点内仍逐条保持节奏防风控。
+    """
+    store.init_db(db_path)
+    profs = profiles if profiles is not None else store.list_profiles(db_path)
+    enabled = [p for p in profs if p.get("monitor_enabled", 1)]
+    by_dom: dict[str, list[dict]] = {}
+    for p in enabled:
+        by_dom.setdefault(p["domain"], []).append(p)
+    total = len(enabled)
+    if not total:
+        return {"checked": 0, "anomalies": 0}
+
+    state = {"done": 0, "anomalies": 0}
+    lock = threading.Lock()
+
+    def _dom_job(domain: str) -> None:
+        adapter = adapter_factory(domain)
+
+        def _item(profile, checked, anomalies):
+            # 每完成一条:累计并回调(UI 显示当前 ASIN;加锁保计数一致)
+            with lock:
+                state["done"] += checked
+                state["anomalies"] += anomalies
+                if on_progress:
+                    on_progress(state["done"], total, domain, profile)
+
+        try:
+            run_round(db_path, adapter, profiles=by_dom[domain], on_item=_item)
+        finally:
+            adapter.close()
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(by_dom) or 1)) as ex:
+        for dom in list(by_dom):
+            ex.submit(_dom_job, dom)
+    return {"checked": state["done"], "anomalies": state["anomalies"]}
 
 
 def add_profile(db_path, *, asin: str, domain: str, url: str = "",
