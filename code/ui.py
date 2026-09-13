@@ -446,6 +446,11 @@ def unload_all_mock():
 init_db()
 monitor_store.init_db(MONITOR_DB)   # 监控库补列迁移(bsr_cat/bsr_sub 等)在启动时跑
 
+# 应用内定时采集:后台守护线程,间隔/开关存 settings 表,UI 改完即生效
+from monitor.scheduler import Scheduler as _MonitorScheduler
+monitor_scheduler = _MonitorScheduler(MONITOR_DB)
+monitor_scheduler.start()
+
 # ---------- 设计系统:可复用的小组件 ----------
 
 # ui.html 在 NiceGUI 3.x 必须显式给 sanitize;本应用的 html() 只承载
@@ -1155,6 +1160,9 @@ def page_monitor():
                 ui.button("添加监控", icon="add_link",
                           on_click=lambda: add_monitor_dialog(refresh)) \
                     .props("unelevated no-caps dense color=primary")
+                ui.button("定时与通知", icon="schedule",
+                          on_click=schedule_dialog) \
+                    .props("outline no-caps dense")
                 if has_data:
                     q = ui.input(placeholder="搜索标题 / ASIN / URL …") \
                         .props("outlined dense hide-bottom-space") \
@@ -1316,6 +1324,87 @@ def page_monitor():
         rebuild()
 
 
+def schedule_dialog():
+    """定时采集 + 钉钉通知设置:配置存 settings 表,后台线程实时读取生效。"""
+    from monitor import notify as mn
+    sget, sset = monitor_store.get_setting, monitor_store.set_setting
+    cfg = mn.get_config(MONITOR_DB)
+    with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">定时采集与通知</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+
+        # 定时采集
+        enabled = ui.switch("开启定时采集",
+                            value=sget(MONITOR_DB, "schedule_enabled", "0") == "1")
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("采集间隔(小时)").classes("pg-meta")
+            interval = ui.number(value=float(sget(MONITOR_DB,
+                                                  "schedule_interval_h", "6") or 6),
+                                 min=0.5, max=168, step=0.5, format="%.1f") \
+                .props("outlined dense").classes("w-32")
+        last_run = sget(MONITOR_DB, "schedule_last_run", "")
+        last_stat = sget(MONITOR_DB, "schedule_last_stat", "")
+        html(f'<div class="pg-meta">上次:{last_run or "未跑过"}'
+             f'{(" · " + last_stat) if last_stat else ""}'
+             f'<br>仅采集真实链接(演示数据自动跳过),按站点并行无头浏览器。</div>')
+
+        ui.separator()
+        # 钉钉通知
+        html('<div class="card-title" style="font-size:14px">钉钉机器人通知</div>')
+        wh = ui.input("Webhook 地址",
+                      value=sget(MONITOR_DB, "notify_webhook", cfg["webhook"]),
+                      placeholder="https://oapi.dingtalk.com/robot/send?access_token=***") \
+            .props("outlined dense").classes("w-full")
+        sec = ui.input("加签密钥(SEC 开头,未加签留空)",
+                       value=sget(MONITOR_DB, "notify_secret", cfg["secret"])) \
+            .props("outlined dense").classes("w-full")
+        mute = ui.number("同一异常静默期(小时)",
+                         value=float(sget(MONITOR_DB, "notify_mute_h", "12") or 12),
+                         min=0, max=720, step=1) \
+            .props("outlined dense").classes("w-40")
+        html('<div class="pg-meta">有新增异常时推送;静默期内同一 ASIN 的'
+             '同类变化只提醒一次,防刷屏。</div>')
+
+        def _save():
+            sset(MONITOR_DB, "schedule_enabled", "1" if enabled.value else "0")
+            sset(MONITOR_DB, "schedule_interval_h", str(interval.value or 6))
+            sset(MONITOR_DB, "notify_webhook", (wh.value or "").strip())
+            sset(MONITOR_DB, "notify_secret", (sec.value or "").strip())
+            sset(MONITOR_DB, "notify_mute_h", str(mute.value or 12))
+            ui.notify("已保存,定时采集按新配置运行", type="positive")
+            d.close()
+
+        async def _test():
+            ok, msg = await run.io_bound(
+                mn.push_text, MONITOR_DB,
+                "AmCheck 测试消息:通知配置 OK ✅")
+            ui.notify(msg, type="positive" if ok else "negative")
+
+        async def _run_now():
+            # 立即跑一轮(复用调度器逻辑:真实链接采集 + 通知推送)
+            from monitor.scheduler import run_once
+            d.close()
+            ui.notify("采集进行中,完成后自动刷新…", type="info")
+            try:
+                r = await run.io_bound(run_once, MONITOR_DB)
+                ui.notify(f"采集完成:检查 {r['checked']} 条,"
+                          f"异常 {r['anomalies']} 条",
+                          type="warning" if r["anomalies"] else "positive")
+                ui.navigate.reload()
+            except Exception as e:
+                ui.notify(f"采集失败:{e.__class__.__name__}: {e}",
+                          type="negative")
+
+        with ui.row().classes("w-full justify-end gap-2 mt-1"):
+            ui.button("测试推送", on_click=_test).props("outline no-caps dense")
+            ui.button("立即采集一轮", on_click=_run_now) \
+                .props("outline no-caps dense")
+            ui.button("保存", on_click=_save) \
+                .props("unelevated no-caps dense color=primary")
+    d.open()
+
+
 def add_monitor_dialog(on_done):
     """添加监控弹窗:粘贴 Amazon 商品页链接(或手填 ASIN),入库 profiles。"""
     with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
@@ -1381,8 +1470,11 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
     from monitor import store as ms
     from monitor.pipeline import run_round_parallel
     from monitor.address import PlaywrightAdapter
+    from monitor.scheduler import _demo_asins
 
-    profs = ms.list_profiles(MONITOR_DB)
+    # 演示 ASIN 跳过真实抓取(会把种子时间线打成脏数据)
+    profs = [p for p in ms.list_profiles(MONITOR_DB)
+             if p["asin"] not in _demo_asins()]
     if not profs:
         ui.notify("还没有监控链接,先点「添加监控」", type="warning")
         return
@@ -1393,7 +1485,7 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
         total = len(enabled)
 
         state = {"done": 0, "anom": 0, "line": f"准备并行采集 {total} 条 / {len(domains)} 站…",
-                 "finished": False, "error": ""}
+                 "finished": False, "error": "", "pushed": 0}
 
         btn.props("disable loading")
         prog_row.set_visibility(True)
@@ -1414,6 +1506,14 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
                 MONITOR_DB, lambda dom: PlaywrightAdapter(dom),
                 profiles=profs, on_progress=on_progress)
             state["anom"] = r["anomalies"]
+            if r["anomalies"]:
+                # 工作线程里推钉钉(网络调用不碰 UI);未配置 webhook 自动跳过
+                try:
+                    from monitor.notify import notify_new_anomalies
+                    state["pushed"] = notify_new_anomalies(MONITOR_DB,
+                                                           r["anomalies"])
+                except Exception:
+                    pass
             return r["checked"]
 
         async def _poll():
@@ -1432,7 +1532,9 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
                         f'<span style="color:{color};font-weight:600">'
                         f'采集完成 {state["done"]} 条 · 异常 {state["anom"]} 条</span>')
                     ui.notify(f"采集完成:{state['done']} 条,"
-                              f"发现异常 {state['anom']} 条",
+                              f"发现异常 {state['anom']} 条"
+                              + (f",已推送 {state['pushed']} 条通知"
+                                 if state["pushed"] else ""),
                               type="warning" if state["anom"] else "positive")
                 btn.props(remove="disable loading")
                 on_done()  # 重建表格与切卡(不跳页,筛选状态保留)

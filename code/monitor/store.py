@@ -85,6 +85,27 @@ def init_db(path: Path = DEFAULT_DB) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS ix_anom_asdomain_time "
                      "ON anomalies (asin, domain, checked_at)")
 
+        # 应用设置(键值):定时采集间隔/开关、钉钉 webhook、通知静默期等
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+
+
+# ---------- settings ----------
+
+def get_setting(path: Path, key: str, default: str = "") -> str:
+    with _connect(path) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?",
+                           (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(path: Path, key: str, value: str) -> None:
+    with _connect(path) as conn:
+        conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, str(value)))
+
 
 # ---------- profiles ----------
 
