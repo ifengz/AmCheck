@@ -717,6 +717,7 @@ def page_history():
                 meta = html('')
             with ui.row().classes("items-center gap-2"):
                 # 时间范围:三个独立按钮,选中态 = 浅蓝底+蓝字(非实心,与空心按钮同族)
+                # 四个按钮锁同宽,字数不齐也排整齐
                 range_btns = {}
                 for val, label in [(7, "近 7 天"), (30, "近 30 天"), (None, "全部")]:
                     def _pick(v=val):
@@ -728,10 +729,10 @@ def page_history():
                                 bb.classes(remove="bg-[#eff6ff] text-[#2563eb]")
                         load_rows()
                     range_btns[val] = ui.button(label, on_click=_pick) \
-                        .props("outline no-caps dense")
+                        .props("outline no-caps dense").classes("w-[88px]")
                 range_btns[7].classes(add="bg-[#eff6ff] text-[#2563eb]")
                 ui.button("统计", icon="bar_chart", on_click=lambda: stats_dialog(days["kw"])) \
-                    .props("outline no-caps dense")
+                    .props("outline no-caps dense").classes("w-[88px]")
 
         def h_row(r):
             rid, domain, url, status, stars, title, author, review_date, note, checked = r
