@@ -1135,20 +1135,11 @@ def page_monitor():
         def refresh():
             ui.navigate.to("/monitor")
 
-        # 空态:给真实入口(添加监控 / 演示数据),而不是一句干巴巴的提示
-        if not MONITOR_DB.exists() or monitor_store.count_snapshots(MONITOR_DB) == 0:
-            html('<div class="pg-title">链接监控</div>')
-            html('<div class="pg-meta">盯住产品页变化:价格 / 评分 / 评价数 / '
-                 '上下架。先添加要监控的链接,再跑一轮采集生成看板。</div>')
-            with ui.row().classes("mt-3 gap-2"):
-                ui.button("添加监控", icon="add_link",
-                          on_click=lambda: add_monitor_dialog(refresh)) \
-                    .props("unelevated no-caps color=primary")
-                ui.button("载入演示数据", icon="science", on_click=toggle_mock) \
-                    .props("outline no-caps")
-            return
-
         from monitor import board as monitor_board
+
+        # 有数据 / 无数据共用同一套页头版式(以前空态另起一套,位置跳来跳去)
+        has_data = (MONITOR_DB.exists()
+                    and monitor_store.count_snapshots(MONITOR_DB) > 0)
 
         # 页头一行:左「标题+副行摘要」,右「操作+搜索」
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
@@ -1164,9 +1155,10 @@ def page_monitor():
                 ui.button("添加监控", icon="add_link",
                           on_click=lambda: add_monitor_dialog(refresh)) \
                     .props("unelevated no-caps dense color=primary")
-                q = ui.input(placeholder="搜索标题 / ASIN / URL …") \
-                    .props("outlined dense hide-bottom-space") \
-                    .classes("w-64").style("font-size:13px")
+                if has_data:
+                    q = ui.input(placeholder="搜索标题 / ASIN / URL …") \
+                        .props("outlined dense hide-bottom-space") \
+                        .classes("w-64").style("font-size:13px")
 
         # 采集进度条:平时隐藏,「跑一轮采集」时出现,完成后停留显示结果
         prog_row = ui.row().classes("w-full items-center gap-3 mb-1")
@@ -1174,6 +1166,17 @@ def page_monitor():
             prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
             prog_text = ui.label("").classes("pg-meta")
         prog_row.set_visibility(False)
+
+        if not has_data:
+            # 空态只换正文区,页头不动;给真实入口(添加监控 / 演示数据)
+            summary.set_content('<div class="pg-meta">盯住产品页变化:价格 / 评分 / '
+                                '评价数 / 上下架</div>')
+            html('<div class="pg-meta" style="margin:8px 0 12px">还没有监控数据:'
+                 '先「添加监控」粘贴商品链接,再「跑一轮采集」生成看板;'
+                 '或先载入演示数据看效果。</div>')
+            ui.button("载入演示数据", icon="science", on_click=toggle_mock) \
+                .props("outline no-caps")
+            return
 
         # 国家切卡:全部 + IN/AU/US/JP/MX/BR,点某国只看该国,再点恢复全部
         cur = {"cc": "全部"}
