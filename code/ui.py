@@ -1218,6 +1218,8 @@ def page_monitor():
                          f'DP 描述</div><div class="mon-txt-body">'
                          f'{html_mod.escape(snap.get("description") or "—")}</div></div>')
         CC_ORDER = ["全部", "IN", "AU", "US", "JP", "MX", "BR"]
+        CC_FLAGS = {"IN": "🇮🇳", "AU": "🇦🇺", "US": "🇺🇸", "JP": "🇯🇵",
+                    "MX": "🇲🇽", "BR": "🇧🇷"}
 
         def pick(cc):
             # 点已选中的卡恢复全部;换卡直接切换
@@ -1248,9 +1250,10 @@ def page_monitor():
                             "padding:4px 12px;min-height:0;height:32px;cursor:pointer;"
                             "box-shadow:none;")
                     with b:
+                        flag = CC_FLAGS.get(cc, "")
                         html(f'<span class="kpi-num" style="color:{num_color}">'
                              f'{num}</span>'
-                             f'<span class="kpi-tag">{cc}</span>')
+                             f'<span class="kpi-tag">{cc}{(" " + flag) if flag else ""}</span>')
 
             anom_by_key = {(a["anomaly"]["asin"], a["anomaly"]["domain"]): a["anomaly"]
                            for a in data_now["anomalies"]}
