@@ -1200,7 +1200,7 @@ def page_monitor():
             return
 
         # 国家切卡:全部 + IN/AU/US/JP/MX/BR,点某国只看该国,再点恢复全部
-        grid_holder = ui.column().classes("w-full")
+        grid_holder = ui.column().classes("w-full flex-grow min-h-0")
         # 表格下方文案区:点行后展示该 ASIN 的标题 / BP / DP 全文
         text_holder = ui.column().classes("w-full")
 
@@ -1315,8 +1315,7 @@ def page_monitor():
                 "defaultColDef": {"sortable": True, "resizable": True},
                 "rowHeight": 30,
             }, html_columns=html_cols, auto_size_columns=False) \
-                .classes("w-full ag-dense") \
-                .style(f"height:{min(34 + 30 * (len(rows) + 1), 640)}px")
+                .classes("w-full ag-dense ag-fill")
 
             def _click(e):
                 data = e.args.get("data") or {}

@@ -12,8 +12,9 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 
 /* 主区:斜向细线纹理(品牌特色,替代通用点阵)——
    135° 双层斜线交织出细织布纹理,极低对比不抢内容。
-   宽度不限:全宽跟随窗口,大屏由表格 flex 列吸收多余宽度 */
-.main-area {padding: 16px 20px 24px; gap: 0; width: 100%;
+   宽度不限:全宽跟随窗口,大屏由表格 flex 列吸收多余宽度;
+   min-height 一屏 + 列向弹性,让表格用 flex-grow 撑到底部 */
+.main-area {padding: 16px 20px 24px; gap: 0; width: 100%; min-height: 100vh;
   background-image:
     repeating-linear-gradient(135deg, rgba(37, 99, 235, 0.035) 0 1px, transparent 1px 12px),
     repeating-linear-gradient(45deg, rgba(30, 41, 59, 0.025) 0 1px, transparent 1px 12px);}
@@ -74,8 +75,9 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 .ag-dense .ag-cell {padding-left: 8px !important; padding-right: 8px !important;}
 .ag-dense .ag-header-cell {padding-left: 8px !important; padding-right: 8px !important;}
 .cell-status {display: flex; align-items: center;}
-/* 主表格撑满剩余视口(最少 420px) */
-.ag-fill {min-height: 420px; height: calc(100vh - 280px);}
+/* 主表格撑满剩余视口:主区至少一屏高,表格作为弹性项吃掉余量,
+   不再写死 calc 高度(那会随页头行数变化在底部留白) */
+.ag-fill {min-height: 420px; flex: 1 1 auto;}
 
 /* 输入控件密度 */
 .q-field--outlined .q-field__control {border-radius: 6px;}
