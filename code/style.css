@@ -13,15 +13,17 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 /* 主区:斜向细线纹理(品牌特色,替代通用点阵)——
    135° 双层斜线交织出细织布纹理,极低对比不抢内容。
    宽度不限:全宽跟随窗口,大屏由表格 flex 列吸收多余宽度;
-   min-height 一屏 + 列向弹性,让表格用 flex-grow 撑到底部 */
-.main-area {padding: 16px 20px 24px; gap: 0; width: 100%; min-height: 100vh;
+   min-height 一屏 + 列向弹性,让表格用 flex-grow 撑到底部。
+   扣掉外层 nicegui-content 的上下各 16px 内边距:
+   写 100vh 会让整页超高 32px 出现竖向滚动条,右侧间隙比左侧大 */
+.main-area {padding: 16px 20px 24px; gap: 0; width: 100%; min-height: calc(100vh - 32px);
   background-image:
     repeating-linear-gradient(135deg, rgba(37, 99, 235, 0.035) 0 1px, transparent 1px 12px),
     repeating-linear-gradient(45deg, rgba(30, 41, 59, 0.025) 0 1px, transparent 1px 12px);}
 
-/* 侧边栏:白底右描边 */
+/* 侧边栏:白底右描边(同 main-area,扣掉外层 32px 内边距避免撑出滚动条) */
 .sidebar {width: 220px; flex: none; background: #fff; border-right: 1px solid var(--line);
-  min-height: 100vh; padding: 10px 8px; gap: 0;}
+  min-height: calc(100vh - 32px); padding: 10px 8px; gap: 0;}
 .brand-mark {width: 30px; height: 30px; border-radius: 7px; background: var(--pri);
   color: #fff; font-weight: 800; font-size: 15px; display: flex;
   align-items: center; justify-content: center;}
