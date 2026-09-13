@@ -535,26 +535,53 @@ def page_check():
                         refs = refs[:MAX_BATCH]
                         ui.notify(f"一次最多 {MAX_BATCH} 条,已截取", type="warning")
                     btn.props("disable loading")
+                    prog_row.set_visibility(True)
+                    stats_text.set_visibility(True)
+                    prog.set_value(0)
+                    prog_text.set_text("准备中…")
+                    stats_text.set_text("")
                     prev = last_status_map(refs)
                     checker = ReviewChecker()
 
                     async def _run():
+                        # 工作线程只写 state,ui.timer 轮询画到屏幕(与监控页同款)
+                        state = {"done": 0, "line": "", "tally": "", "error": ""}
+
                         def _work():
                             out = []
+                            counts = {}
                             def on_result(i, ref, r):
                                 out.append(r)
-                                prog.set_value((i + 1) / len(refs))
-                                prog_text.set_text(
+                                counts[r["status"]] = counts.get(r["status"], 0) + 1
+                                state["done"] = i + 1
+                                state["line"] = (
                                     f"[{i + 1}/{len(refs)}] {DOMAIN_SHORT(ref.domain)} · "
-                                    f"{ref.review_id} → {STATUS_LABEL.get(r['status'], r['status'])}")
+                                    f"{ref.review_id} → "
+                                    f"{STATUS_LABEL.get(r['status'], r['status'])}")
+                                tally = " · ".join(
+                                    f"{STATUS_LABEL.get(s, s)} {n}"
+                                    for s, n in sorted(counts.items(),
+                                                       key=lambda kv: -kv[1]))
+                                state["tally"] = (f"剩余 {len(refs) - (i + 1)} 条 · "
+                                                  + tally)
                             try:
                                 checker.check_batch(refs, on_result=on_result)
                             except Exception as e:
-                                ui.notify(f"检测中断:{e}", type="negative")
+                                state["error"] = str(e)
                             finally:
                                 checker.close()
                             return out
+
+                        def _poll():
+                            prog.set_value(state["done"] / len(refs))
+                            prog_text.set_text(state["line"] or "准备中…")
+                            stats_text.set_text(state["tally"])
+
+                        timer = ui.timer(0.2, _poll)
                         results_new = await run.io_bound(_work)
+                        timer.cancel()
+                        if state["error"]:
+                            ui.notify(f"检测中断:{state['error']}", type="negative")
                         btn.props(remove="disable loading")
                         if results_new:
                             save_history(results_new)
@@ -568,7 +595,9 @@ def page_check():
                 with prog_row:
                     prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
                     prog_text = ui.label("").classes("pg-meta")
+                stats_text = ui.label("").classes("pg-meta")
                 prog_row.set_visibility(False)
+                stats_text.set_visibility(False)
                 btn.on("click", do_check)
         else:
             # ── 结果视图 ──
