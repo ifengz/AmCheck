@@ -1462,7 +1462,7 @@ def login_dialog():
         with ui.row().classes("w-full items-center justify-between"):
             html('<div class="card-title">Amazon 账号登录管理</div>')
             ui.button(icon="close", on_click=d.close).props("flat round dense")
-        sel = ui.select({d: f"{d} · {'已登录 ' + str(status[d]['days']) + 'd' if status.get(d, {}).get('ok') else '未登录'}"
+        sel = ui.select({d: f"{d} · {'已登录' if status.get(d, {}).get('ok') else '未登录'}"
                          for d in domains}, value=domains[0]) \
             .props("outlined dense").classes("w-full")
         account = ui.input("Amazon 账号").props("outlined dense").classes("w-full")
