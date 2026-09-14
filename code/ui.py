@@ -656,7 +656,7 @@ def page_check():
                     kpi_btn("未知", str(counts.get("unknown", 0)), "ink", "unknown")
                 with ui.row().classes("items-center gap-2 flex-none"):
                     # 两个按钮锁同宽,免得「新一轮」字短显得一宽一窄
-                    ui.button("导出 CSV", icon="download") \
+                    btn_csv = ui.button("导出 CSV", icon="download") \
                         .props("outline no-caps dense").classes("w-[116px]")
                     ui.button("新一轮", icon="refresh", on_click=lambda: (
                         app.storage.user.update(results=[], prev={}, res_filter="all",
@@ -737,6 +737,29 @@ def page_check():
                                        if r["review_id"] == rid))
             grid.on("cellClicked", on_cell_click)
 
+            def do_export():
+                # 导出的是「当前看到的」:跟随 KPI 筛选 + 搜索框,所见即所得
+                buf = io.StringIO()
+                w = csv.writer(buf)
+                w.writerow(["状态", "Review ID", "链接", "站点", "星级", "VP",
+                            "标题", "作者", "评价日期", "判定依据", "检测时间"])
+                for r in shown:
+                    w.writerow([
+                        STATUS_LABEL.get(r["status"], r["status"]),
+                        r["review_id"], r["url"], DOMAIN_SHORT(r["domain"]),
+                        r["stars"] if str(r["stars"]).isdigit() else "",
+                        "是" if r["verified"] else "",
+                        r["title"] or "", r["author"] or "",
+                        r["review_date"] or "", r["note"] or "",
+                        r["checked_at"],
+                    ])
+                # BOM:Excel 双击打开 csv 不乱码
+                ui.download.content("\ufeff" + buf.getvalue(),
+                                    f"评价检测结果_{results[0]['checked_at'][:10]}.csv",
+                                    media_type="text/csv")
+
+            btn_csv.on("click", lambda e: do_export())
+
 
 def detail_dialog(r: dict):
     """行点选 → 结果详情弹窗。"""
@@ -761,7 +784,10 @@ def detail_dialog(r: dict):
             ui.image(r["screenshot"]).classes("w-full rounded-md")
         with ui.row():
             # 这里打开的是评价链接,与抽屉里的文案保持一致
-            ui.button("打开评价页面", on_click=lambda: ui.open(r["url"], new_tab=True)) \
+            # NiceGUI 3.x 移除了 ui.open,改用 window.open 新标签页
+            ui.button("打开评价页面",
+                      on_click=lambda u=r["url"]: ui.run_javascript(
+                          f"window.open({json.dumps(u)}, '_blank')")) \
                 .props("outline no-caps dense icon=open_in_new")
             if len(review_history_timeline(r["review_id"])) > 1:
                 ui.button("历史轨迹").props("outline no-caps dense")
@@ -991,7 +1017,9 @@ def fill_review_drawer(body, drawer, review_id, on_refresh=None):
 
         with ui.row().classes("items-center gap-2"):
             if url:
-                ui.button("打开评价页面", on_click=lambda u=url: ui.open(u, new_tab=True)) \
+                ui.button("打开评价页面",
+                          on_click=lambda u=url: ui.run_javascript(
+                              f"window.open({json.dumps(u)}, '_blank')")) \
                     .props("outline no-caps dense icon=open_in_new")
                 ui.button("复制评价链接",
                           on_click=lambda u=url: (
@@ -1394,21 +1422,38 @@ _CHG_BASE = '<span style="color:#cbd5e1">基准</span>'
 
 
 def _field_changed(getter, fmt, snap, prev) -> bool:
-    """该字段本次快照较上一条是否变化。展示串相同不算变(避开 None/"" 等价)。"""
+    """该字段本次快照较上一条是否变化。展示串相同不算变(避开 None/"" 等价)。
+
+    任何一边「这一拍没读到」(None/空串/空列表)都不算变化:实测同一链接的
+    buybox/price 会在「有值↔空」之间反复跳(懒加载/版式差异/软风控只挡某个
+    模块),把空当成一个值去比,就会每跳一次亮一次「有更新」—— 看板首加链接
+    满屏假变化的第二个成因(第一个是整页风控,由 snapshot_usable 挡)。
+    与 rules._stable_changed 同一套口径。
+    """
     if prev is None:
         return False
-    v, pv = fmt(getter(snap)), fmt(getter(prev))
-    return v != pv
+    from monitor.rules import _is_blank
+    rv, rp = getter(snap), getter(prev)
+    if _is_blank(rv) or _is_blank(rp):
+        return False
+    return fmt(rv) != fmt(rp)
 
 
 def _matrix_row(db_path, asin, domain, snap, anom_by_key) -> dict:
     """一行 = 一个 ASIN:ASIN/最后更新/每字段是否变化/异常徽标。
 
-    变化判定取最近两拍快照(本次采集 vs 上次采集)。
+    变化判定取最近两拍**可用**快照(本次采集 vs 上次真正抓到数据的采集)。
+    残缺快照(风控页/加载不全,字段全空)必须跳过:否则首加链接第一轮
+    落在风控页、第二轮抓到真数据,整行每格都从「空→有值」= 满屏「有更新」。
     """
     from monitor.board import _status_label
-    snaps = monitor_store.snapshots_for(db_path, asin, domain, limit=2)
+    from monitor.rules import snapshot_usable
+    snaps = [s for s in monitor_store.snapshots_for(db_path, asin, domain, limit=6)
+             if snapshot_usable(s)]
+    # 当前行本身是残缺快照时,它不进对比链(上一格也拿它比会假变化)
     prev = snaps[-2] if len(snaps) >= 2 else None
+    if not snapshot_usable(snap):
+        prev = None
     a = anom_by_key.get((asin, domain))
     sev = (a or {}).get("severity", "ok")
 
@@ -1502,11 +1547,16 @@ def _detail_rows(snaps, fields) -> list[dict]:
     多字段组(评价/状态/报价/文案):更新时间 | 字段A | 字段B | … | 是否有变化 | 变化内容。
     任一字段变即算该行有变化;变化内容按字段前缀列出各字段的变化。
     数字类字段变化内容留空(上下行"当时值"直接对比);文案类走词级 diff。
+
+    残缺拍(风控页/加载不全,价格评分全空)标「风控页」,且不能当对比对象:
+    拿空值和真值比,每一格都是假"有更新"。
     """
+    from monitor.rules import snapshot_usable
     ordered = list(reversed(snaps))
     rows = []
     for i, s in enumerate(ordered):
-        prev = ordered[i + 1] if i + 1 < len(ordered) else None
+        # 对比对象 = 下方最近一条可用快照(跳过残缺拍)
+        prev = next((o for o in ordered[i + 1:] if snapshot_usable(o)), None)
         row = {"time": (s.get("checked_at") or "")[5:16]}
         any_chg = False
         diffs = []
@@ -1522,7 +1572,10 @@ def _detail_rows(snaps, fields) -> list[dict]:
                     if d != "—":
                         seg = d if len(fields) == 1 else f"{lab}:{d}"
                         diffs.append(seg)
-        if prev is None:
+        if not snapshot_usable(s):
+            row["chg"] = '<span style="color:#94a3b8">风控页</span>'
+            row["diff"] = '<span style="color:#cbd5e1">—</span>'
+        elif prev is None:
             row["chg"] = _CHG_BASE
             row["diff"] = '<span style="color:#cbd5e1">—</span>'
         elif any_chg:
@@ -1578,7 +1631,8 @@ def page_monitor():
             with ui.row().classes("w-full items-center justify-between"):
                 if p.get("url"):
                     ui.button("打开商品页面",
-                              on_click=lambda u=p["url"]: ui.open(u, new_tab=True)) \
+                              on_click=lambda u=p["url"]: ui.run_javascript(
+                                  f"window.open({json.dumps(u)}, '_blank')")) \
                         .props("outline no-caps dense icon=open_in_new")
                 with ui.row().classes("items-center gap-2"):
                     if _has_unconfirmed(MONITOR_DB, asin, domain):
@@ -1763,11 +1817,32 @@ def page_monitor():
             prog_text = ui.label("").classes("pg-meta")
         prog_row.set_visibility(False)
 
-        # 国家切卡 + 操作按钮同一行:左侧国家卡,右侧三个按钮(右缘与搜索框对齐)
-        cur = {"cc": "全部"}
+        # 「刷新」按钮的本地重绘入口:有数据 → rebuild();空态 → render_empty()。
+        # 默认值是整页跳转兜底(理论上不会用到,两条分支都会覆盖它)
+        _repaint = {"fn": refresh}
+
+        def soft_refresh():
+            """只重读库、重画明细区(表格 + 已添加未采集),不做整页跳转。
+
+            页面骨架(页头/按钮/搜索框/抽屉)原地保留,滚动位置不丢;
+            仅当快照有无被别的进程翻转(如后台定时采集刚出第一批数据)时,
+            空态/有数据两套骨架互切才需要整页跳转。
+            """
+            now_data = (MONITOR_DB.exists()
+                        and monitor_store.count_snapshots(MONITOR_DB) > 0)
+            if now_data != has_data:
+                refresh()
+                return
+            _repaint["fn"]()
+
+        # 国家切卡 + 操作按钮同一行:左侧国家卡,右侧按钮(右缘与搜索框对齐)
+        # st = 状态筛选:None 不限 / "abnormal" 只看异常 / "normal" 只看正常
+        cur = {"cc": "全部", "st": None}
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
             card_holder = ui.row().classes("items-center gap-2 flex-grow")
             with ui.row().classes("items-center gap-2 flex-none"):
+                ui.button("刷新", icon="refresh", on_click=soft_refresh) \
+                    .props("outline no-caps dense").classes("w-[116px]")
                 btn_run = ui.button(
                     "跑一轮采集",
                     on_click=lambda: run_monitor_round(
@@ -1781,52 +1856,79 @@ def page_monitor():
                           on_click=schedule_dialog) \
                     .props("outline no-caps dense").classes("w-[116px]")
 
+        def _pending_card(pend, note=None):
+            """把「已添加未采集」的链接列成卡片(空态与有数据页共用)。
+
+            这批链接没有快照、进不了看板表格 —— 不列出来的话,在已有数据的
+            页面上添加新链接就完全找不到,表现就是「加完不知道在哪」。
+            """
+            if note:
+                html(note)
+            with ui.card().classes("app-card w-full"):
+                for p in pend:
+                    with ui.row().classes("w-full items-center gap-3 no-wrap") \
+                            .style("padding:6px 2px;"
+                                   "border-bottom:1px solid #f1f5f9"):
+                        html(f'<span style="font-size:13px;font-weight:700;'
+                             f'font-family:ui-monospace,Menlo,monospace;'
+                             f'color:#1e293b">{p["asin"]}</span>'
+                             f'<span class="pg-meta">'
+                             f'{DOMAIN_SHORT(p["domain"])}</span>'
+                             f'<span class="pg-meta" style="flex:1;min-width:0;'
+                             f'overflow:hidden;text-overflow:ellipsis;'
+                             f'white-space:nowrap">'
+                             f'{html_mod.escape(p.get("url") or "")}</span>'
+                             + ('' if p.get("monitor_enabled", 1) else
+                                '<span class="pg-meta">已停用</span>'))
+
+        # 正文区容器:空态与看板都画在这里,「刷新」原地重画,不整页跳转
+        body_holder = ui.column().classes("w-full")
+
+        def render_empty():
+            """空态(含「已添加未采集」中间态)整体重画进 body_holder。"""
+            body_holder.clear()
+            with body_holder:
+                pend = _pending()
+                if pend:
+                    # 中间态:链接已入库,只是还没跑过采集。把链接本身列出来,
+                    # 添加动作就立刻有了回执 —— 不用等采集、也不用靠 toast。
+                    summary.set_content(
+                        f'<div class="pg-meta">已添加 {len(pend)} 条监控链接 · '
+                        '还没有采集数据</div>')
+                    _pending_card(
+                        pend,
+                        note='<div class="pg-meta" style="margin:8px 0 12px">'
+                             '链接已经在监控里了,点上方「跑一轮采集」抓一轮,'
+                             '看板就会长出来。</div>')
+                    return
+                summary.set_content(
+                    '<div class="pg-meta">盯住产品页变化:价格 / 评分 / '
+                    '评价数 / 上下架</div>')
+                html('<div class="pg-meta" style="margin:8px 0 12px">还没有监控数据:'
+                     '先「添加监控」粘贴商品链接,再「跑一轮采集」生成看板;'
+                     '或先打开演示数据看效果。</div>')
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("打开演示数据", icon="science", on_click=toggle_mock) \
+                        .props("outline no-caps dense").classes("w-[116px]")
+
         if not has_data:
             # 空态只换正文区,页头/按钮位不动;给真实入口
-            pend = _pending()
-            if pend:
-                # 中间态:链接已入库,只是还没跑过采集。把链接本身列出来,
-                # 添加动作就立刻有了回执 —— 不用等采集、也不用靠 toast。
-                summary.set_content(
-                    f'<div class="pg-meta">已添加 {len(pend)} 条监控链接 · '
-                    '还没有采集数据</div>')
-                html('<div class="pg-meta" style="margin:8px 0 12px">'
-                     '链接已经在监控里了,点上方「跑一轮采集」抓一轮,'
-                     '看板就会长出来。</div>')
-                with ui.card().classes("app-card w-full"):
-                    for p in pend:
-                        with ui.row().classes("w-full items-center gap-3 no-wrap") \
-                                .style("padding:6px 2px;"
-                                       "border-bottom:1px solid #f1f5f9"):
-                            html(f'<span style="font-size:13px;font-weight:700;'
-                                 f'font-family:ui-monospace,Menlo,monospace;'
-                                 f'color:#1e293b">{p["asin"]}</span>'
-                                 f'<span class="pg-meta">'
-                                 f'{DOMAIN_SHORT(p["domain"])}</span>'
-                                 f'<span class="pg-meta" style="flex:1;min-width:0;'
-                                 f'overflow:hidden;text-overflow:ellipsis;'
-                                 f'white-space:nowrap">'
-                                 f'{html_mod.escape(p.get("url") or "")}</span>'
-                                 + ('' if p.get("monitor_enabled", 1) else
-                                    '<span class="pg-meta">已停用</span>'))
-                return
-            summary.set_content('<div class="pg-meta">盯住产品页变化:价格 / 评分 / '
-                                '评价数 / 上下架</div>')
-            html('<div class="pg-meta" style="margin:8px 0 12px">还没有监控数据:'
-                 '先「添加监控」粘贴商品链接,再「跑一轮采集」生成看板;'
-                 '或先打开演示数据看效果。</div>')
-            with ui.row().classes("items-center gap-2"):
-                ui.button("打开演示数据", icon="science", on_click=toggle_mock) \
-                    .props("outline no-caps dense").classes("w-[116px]")
+            _repaint["fn"] = render_empty
+            render_empty()
             return
 
         # 国家切卡:全部 + IN/AU/US/JP/MX/BR,点某国只看该国,再点恢复全部
-        grid_holder = ui.column().classes("w-full flex-grow min-h-0")
-        # 表格下方文案区:点行后展示该 ASIN 的标题 / BP / DP 全文
-        text_holder = ui.column().classes("w-full")
+        with body_holder:
+            grid_holder = ui.column().classes("w-full flex-grow min-h-0")
+            # 表格下方文案区:点行后展示该 ASIN 的标题 / BP / DP 全文
+            text_holder = ui.column().classes("w-full")
 
         def show_text_panel(asin, domain):
-            snap = monitor_store.latest_snapshot(MONITOR_DB, asin, domain) or {}
+            from monitor.rules import snapshot_usable
+            snap = (monitor_store.latest_usable_snapshot(
+                        MONITOR_DB, asin, domain, snapshot_usable)
+                    or monitor_store.latest_snapshot(MONITOR_DB, asin, domain)
+                    or {})
             text_holder.clear()
             with text_holder:
                 with ui.card().classes("app-card w-full mt-2"):
@@ -1853,38 +1955,62 @@ def page_monitor():
                     "MX": "🇲🇽", "BR": "🇧🇷"}
 
         def pick(cc):
-            # 点已选中的卡恢复全部;换卡直接切换
+            # 点已选中的国家卡恢复全部;换卡直接切换
             cur["cc"] = "全部" if cur["cc"] == cc else cc
             rebuild()
 
+        def pick_st(st):
+            # 状态卡:再点一次取消;异常/正常互斥(点一张即切到另一张)
+            cur["st"] = None if cur["st"] == st else st
+            rebuild()
+
         def rebuild():
-            # 每次都重取:跑完一轮采集 / 添加链接 / 确认基线后,卡片与表格都是最新
+            # 每次都重取:跑一轮采集 / 添加链接 / 确认基线后,卡片与表格都是最新。
+            # 也是「刷新」按钮的入口:重读库重画明细,不做整页跳转。
+            _repaint["fn"] = rebuild
             data_now = monitor_board.get_board_data(MONITOR_DB)
             counts = {}
             for domain in (k[1] for k in data_now["latest"]):
                 cc = DOMAIN_SHORT(domain)
                 counts[cc] = counts.get(cc, 0) + 1
+            # 状态卡数量跟着当前国家卡走:先按国家圈定,再分异常/正常
+            anom_keys = {(a["anomaly"]["asin"], a["anomaly"]["domain"])
+                         for a in data_now["anomalies"]}
+            st_counts = {"abnormal": 0, "normal": 0}
+            for (asin, domain) in data_now["latest"]:
+                if cur["cc"] != "全部" and DOMAIN_SHORT(domain) != cur["cc"]:
+                    continue
+                st_counts["abnormal" if (asin, domain) in anom_keys
+                          else "normal"] += 1
             card_holder.clear()
             with card_holder:
-                order = CC_ORDER + [c for c in sorted(counts) if c not in CC_ORDER]
-                for cc in order:
-                    if cc != "全部" and counts.get(cc, 0) == 0:
-                        continue  # 没有链接的国家不显示卡片
-                    active = cur["cc"] == cc
+                def seg(label, num, on_click, active):
                     bg = "#eff6ff" if active else "#fff"
                     bd = "#2563eb" if active else "#e2e8f0"
                     num_color = "#2563eb" if active else "#1e293b"
-                    num = data_now["total"] if cc == "全部" else counts.get(cc, 0)
-                    b = ui.button(on_click=lambda e, k=cc: pick(k)) \
-                        .props("flat no-caps dense")
+                    b = ui.button(on_click=on_click).props("flat no-caps dense")
                     b.style(f"background:{bg};border:1px solid {bd};border-radius:6px;"
                             "padding:4px 9px;min-height:0;height:32px;cursor:pointer;"
                             "box-shadow:none;")
                     with b:
-                        flag = CC_FLAGS.get(cc, "")
                         html(f'<span class="kpi-num" style="color:{num_color}">'
                              f'{num}</span>'
-                             f'<span class="kpi-tag">{cc}{(" " + flag) if flag else ""}</span>')
+                             f'<span class="kpi-tag">{label}</span>')
+
+                order = CC_ORDER + [c for c in sorted(counts) if c not in CC_ORDER]
+                for cc in order:
+                    if cc != "全部" and counts.get(cc, 0) == 0:
+                        continue  # 没有链接的国家不显示卡片
+                    num = data_now["total"] if cc == "全部" else counts.get(cc, 0)
+                    flag = CC_FLAGS.get(cc, "")
+                    seg(f'{cc}{(" " + flag) if flag else ""}', num,
+                        lambda e, k=cc: pick(k), cur["cc"] == cc)
+                # 状态切卡(版式同评价历史页):竖线隔开,异常/正常二选一,再点取消
+                ui.separator().props("vertical").classes("self-stretch bg-[#e2e8f0]")
+                seg("异常", st_counts["abnormal"],
+                    lambda e, k="abnormal": pick_st(k), cur["st"] == "abnormal")
+                seg("正常", st_counts["normal"],
+                    lambda e, k="normal": pick_st(k), cur["st"] == "normal")
 
             anom_by_key = {(a["anomaly"]["asin"], a["anomaly"]["domain"]): a["anomaly"]
                            for a in data_now["anomalies"]}
@@ -1893,15 +2019,26 @@ def page_monitor():
                 if cur["cc"] != "全部" and DOMAIN_SHORT(domain) != cur["cc"]:
                     continue
                 row = _matrix_row(MONITOR_DB, asin, domain, snap, anom_by_key)
+                if cur["st"] == "abnormal" and row["_sev"] >= 9:
+                    continue
+                if cur["st"] == "normal" and row["_sev"] < 9:
+                    continue
                 hay = (row["_asin"] + " " + row["_title"] + " "
                        + (row["_url"] or "")).lower()
                 if q.value and q.value.lower() not in hay:
                     continue
                 rows.append(row)
             rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
-            # 新加的链接还没有快照,不会出现在下面的表里 —— 得单独说一句,
-            # 否则在有数据的页面上添加链接,用户同样会觉得「没反应」
-            pend = _pending()
+            # 新加的链接还没有快照,不会出现在下面的表里 —— 直接在表格下方
+            # 列出来(同样按当前国家/搜索词过滤),否则在有数据的页面上
+            # 添加链接,用户根本找不到它在哪;
+            # 选了异常/正常时不列 —— 未采集的链接两边都不算,列出来反而和筛选打架
+            pend = [p for p in _pending()
+                    if cur["st"] is None
+                    and (cur["cc"] == "全部" or DOMAIN_SHORT(p["domain"]) == cur["cc"])
+                    and (not q.value
+                         or q.value.lower()
+                         in (p["asin"] + " " + (p.get("url") or "")).lower())]
             extra = f' · 另有 {len(pend)} 条已添加未采集' if pend else ''
             summary.set_content(
                 f'<div class="pg-meta">监控 {data_now["total"]} 条 · 异常 '
@@ -1911,6 +2048,11 @@ def page_monitor():
             grid_holder.clear()
             with grid_holder:
                 make_grid(rows)
+                if pend:
+                    html('<div class="pg-meta" style="margin:10px 0 6px">'
+                         '以下链接已添加,还没有采集数据 —— '
+                         '点上方「跑一轮采集」后才会进入表格:</div>')
+                    _pending_card(pend)
             text_holder.clear()   # 换筛选/重采后旧的文案区不再对应,清掉
 
         def make_grid(rows):
