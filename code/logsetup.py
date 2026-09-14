@@ -79,6 +79,28 @@ def pick_log_dir() -> Path:
     return FALLBACK_LOG_DIR          # 全都不行也得返回一个,后续写入失败会被吞
 
 
+def _int_env(name: str, default: int) -> int:
+    """读一个整数环境变量,**乱填不能炸**。
+
+    这些变量是在部署脚本里设的,一个手滑(`AMREVIEW_LOG_KEEP_DAYS=abc`)在
+    ``int()`` 上抛 ValueError —— 而本模块是在 ``ui.py`` 导入期跑的,那等于
+    「日志配置写错 → 服务起不来」。宁可退回默认值。
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _level_value(raw: str | None) -> int:
+    """环境变量里的级别名 → 数字。不认识的名字退回 INFO(``setLevel`` 会抛)。"""
+    value = logging.getLevelName((raw or DEFAULT_LEVEL).strip().upper())
+    return value if isinstance(value, int) else logging.INFO
+
+
 def prune(log_dir: Path, keep_days: int = KEEP_DAYS) -> list[str]:
     """删掉超过 keep_days 天的 ``ui-*.log``,返回被删的文件名。"""
     removed: list[str] = []
@@ -231,12 +253,31 @@ def install_faulthandler(log_dir: Path, dump_interval: int = 0) -> None:
 
 
 def install(level: str | None = None, name: str = "amreview") -> Path:
-    """装好日志。幂等,返回实际使用的日志目录。"""
+    """装好日志。幂等,返回实际使用的日志目录。
+
+    **这个函数不允许抛异常。** 它是在 ``ui.py`` 的导入期调的,而它存在的全部
+    意义就是「出事之后还能查到东西」—— 如果装日志本身把服务弄得起不来,那就
+    本末倒置了。所以整段包一层兜底:真出问题就退回基本输出,程序照常跑。
+    """
     if _state["installed"]:
         return _state["dir"]
+    try:
+        return _install_inner(level, name)
+    except Exception as e:
+        # 连"打印一句失败原因"都可能再失败(stderr 被关掉),所以这里也包着
+        _state.update(installed=True, dir=FALLBACK_LOG_DIR, keep=KEEP_DAYS)
+        try:
+            print(f"[logsetup] 日志初始化失败,退回基本输出:"
+                  f" {e.__class__.__name__}: {e}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        return FALLBACK_LOG_DIR
 
+
+def _install_inner(level: str | None, name: str) -> Path:
     log_dir = pick_log_dir()
-    keep = int(os.environ.get("AMREVIEW_LOG_KEEP_DAYS", KEEP_DAYS) or KEEP_DAYS)
+    # 下界 1 天:填成 0 或负数会让 prune 把刚写的日志当场删光
+    keep = max(1, _int_env("AMREVIEW_LOG_KEEP_DAYS", KEEP_DAYS))
 
     # 非 tty 下 stdout 默认块缓冲:显式切行缓冲,本地直跑(不经 deploy.sh)也生效
     for stream in (sys.stdout, sys.stderr):
@@ -246,7 +287,7 @@ def install(level: str | None = None, name: str = "amreview") -> Path:
             pass
 
     root = logging.getLogger()
-    root.setLevel((level or os.environ.get("AMREVIEW_LOG_LEVEL", DEFAULT_LEVEL)).upper())
+    root.setLevel(_level_value(level or os.environ.get("AMREVIEW_LOG_LEVEL")))
     for h in list(root.handlers):
         root.removeHandler(h)              # 别让 uvicorn/nicegui 的默认 handler 重复输出
     fmt = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
@@ -259,10 +300,7 @@ def install(level: str | None = None, name: str = "amreview") -> Path:
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
-    try:
-        dump_interval = int(os.environ.get("AMREVIEW_DUMP_TRACEBACK_SEC", "0") or 0)
-    except ValueError:
-        dump_interval = 0
+    dump_interval = _int_env("AMREVIEW_DUMP_TRACEBACK_SEC", 0)
     install_faulthandler(log_dir, dump_interval)
 
     _state.update(installed=True, dir=log_dir, keep=keep)

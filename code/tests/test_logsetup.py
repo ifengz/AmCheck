@@ -175,6 +175,91 @@ class InstallTests(unittest.TestCase):
             self.assertRegex(text, r"\[MainThread\]")
 
 
+class InstallSafetyTests(unittest.TestCase):
+    """``install()`` 是在 ``ui.py`` 的**导入期**跑的 —— 它抛异常等于服务起不来。
+
+    而它存在的意义偏偏是「出事之后还能查到东西」,所以这里盯的不是日志写得好不好
+    看,而是「坏配置 / 坏环境绝不能把进程带走」。这几条都是 push 前实测出来的:
+    原来 ``int(os.environ[...])`` 和 ``setLevel(...)`` 都会对填错的变量抛
+    ValueError,而它们跑在模块级。
+    """
+
+    ENV_KEYS = ("AMREVIEW_LOG_DIR", "AMREVIEW_LOG_KEEP_DAYS",
+                "AMREVIEW_LOG_LEVEL", "AMREVIEW_DUMP_TRACEBACK_SEC")
+
+    def setUp(self):
+        self._root = logging.getLogger()
+        self._handlers = list(self._root.handlers)
+        self._level = self._root.level
+        self._state = dict(logsetup._state)
+        self._env = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        logsetup._state.clear()
+        logsetup._state.update(installed=False, dir=None, keep=None)
+
+    def tearDown(self):
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in self._handlers:
+            root.addHandler(h)
+        root.setLevel(self._level)
+        logsetup._state.clear()
+        logsetup._state.update(self._state)
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_garbage_numeric_env_does_not_raise(self):
+        """``AMREVIEW_LOG_KEEP_DAYS=abc`` 会让 int() 抛 ValueError 直接炸启动。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["AMREVIEW_LOG_DIR"] = tmp
+            os.environ["AMREVIEW_LOG_KEEP_DAYS"] = "abc"
+            os.environ["AMREVIEW_DUMP_TRACEBACK_SEC"] = "soon"
+            d = logsetup.install()                      # 不许抛
+            self.assertEqual(d, Path(tmp))
+            self.assertEqual(logsetup._state["keep"], logsetup.KEEP_DAYS,
+                             "填错要退回默认保留天数")
+
+    def test_unknown_level_name_falls_back_to_info(self):
+        """``AMREVIEW_LOG_LEVEL=verbose`` 会让 logging.setLevel() 抛 ValueError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["AMREVIEW_LOG_DIR"] = tmp
+            os.environ["AMREVIEW_LOG_LEVEL"] = "verbose"
+            logsetup.install()
+            self.assertEqual(logging.getLogger().level, logging.INFO)
+
+    def test_keep_days_is_clamped_to_at_least_one(self):
+        """填 0 会让 prune 把当天刚写下的日志当场删光 —— 越修越查不到。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["AMREVIEW_LOG_DIR"] = tmp
+            os.environ["AMREVIEW_LOG_KEEP_DAYS"] = "0"
+            logsetup.install()
+            self.assertGreaterEqual(logsetup._state["keep"], 1)
+            logging.getLogger("probe").info("别删我")
+            today = datetime.now().strftime("%Y-%m-%d")
+            self.assertTrue((Path(tmp) / f"ui-{today}.log").exists())
+
+    def test_install_swallows_internal_failure(self):
+        """兜底本身也要有兜底:挑目录都炸了,进程必须照常跑。"""
+        def boom():
+            raise RuntimeError("boom")
+
+        original = logsetup.pick_log_dir
+        logsetup.pick_log_dir = boom
+        try:
+            d = logsetup.install()
+        finally:
+            logsetup.pick_log_dir = original
+        self.assertEqual(d, logsetup.FALLBACK_LOG_DIR)
+        self.assertTrue(logsetup._state["installed"], "失败也要标成已装,避免反复重试")
+
+
 class Sigusr1DumpTests(unittest.TestCase):
     """``kill -USR1 <pid>`` 必须导出**全部**线程栈(而不只是当前线程)。
 
