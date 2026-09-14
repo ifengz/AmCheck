@@ -1,8 +1,31 @@
-streamlit>=1.35
-nicegui>=3.6
+# 直接依赖(应用真正 import 的包)。只写宽范围,精确版本见 requirements.lock.txt。
+#
+# 两份清单的关系(踩过坑):
+#   - 本文件 = 声明「需要什么」,人工维护;
+#   - requirements.lock.txt = 锁定「实测过的精确版本」,由
+#     `pip freeze | sort -f` 生成,start.sh 优先用它。
+#   - 曾经 lock 文件停留在 Streamlit 时代(44 行),整个 NiceGUI 栈
+#     (nicegui/fastapi/uvicorn/starlette…)和 dingtalk-stream 都没写进去,
+#     而 start.sh 又优先用 lock → 全新部署直接 ModuleNotFoundError。
+#     tests/test_requirements.py 现在守着这条:本文件声明的包必须都能在 lock 里找到。
+
+# --- 界面 ---
+nicegui>=3.6                 # 主界面(ui.py)
+streamlit>=1.35              # 旧版界面(app.py,start.sh 的 legacy 模式)
+
+# --- 浏览器自动化 ---
 playwright>=1.45
-openpyxl>=3.1
-xlrd>=2.0          # 只用于读旧版 .xls(Excel 97-2003);不装则导入时给出提示
+
+# --- 表格导入 ---
+openpyxl>=3.1                # .xlsx/.xlsm(ZIP 容器)
+xlrd>=2.0                    # 只用于读旧版 .xls(Excel 97-2003);不装则导入时给出提示
+
+# --- 其它 ---
+pillow                       # ui.image 处理截图、二维码渲染(qrcode[pil])
 qrcode[pil]
 pyotp
-dingtalk-stream>=0.24
+packaging                    # app.py 直接 import(版本比较)
+dingtalk-stream>=0.24        # 监控告警推到钉钉群
+
+# --- 仅测试用,不随部署安装 ---
+# xlwt                       # tests/test_review_import.py 生成旧版 .xls 夹具;不装则相关用例自动跳过
