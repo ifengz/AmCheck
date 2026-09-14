@@ -24,7 +24,7 @@ log = logging.getLogger("monitor-scheduler")
 _TICK = 30.0  # 轮询配置的粒度(秒)
 
 
-def _demo_asins() -> set[str]:
+def demo_asins() -> set[str]:
     try:
         from .demo import TIMELINES
         return set(TIMELINES) | {"B0DEL00001"}
@@ -38,7 +38,7 @@ def run_once(db_path) -> dict:
     from .pipeline import run_round_parallel
     from .notify import notify_new_anomalies
 
-    skip = _demo_asins()
+    skip = demo_asins()
     profs = [p for p in store.list_profiles(db_path)
              if p["asin"] not in skip]
     if not profs:

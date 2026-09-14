@@ -114,6 +114,15 @@ def init_db(path: Path = DEFAULT_DB) -> None:
                 asin TEXT, domain TEXT, rhash TEXT, pushed_at REAL,
                 PRIMARY KEY (asin, domain, rhash))""")
 
+        # 通知静默期状态:记某 (asin, domain, metric) 上次推送时刻,
+        # notify.mark_pushed/last_push 据此判断"静默期内别重复打扰"。
+        # 原先只在建表脚本外由 notify.py 就地 CREATE,schema 散落两处;
+        # 2026-09-14 解耦收口:并入本模块 init_db,表定义单一来源。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notify_state (
+                asin TEXT, domain TEXT, metric TEXT, pushed_at REAL,
+                PRIMARY KEY (asin, domain, metric))""")
+
 
 # ---------- settings ----------
 
@@ -184,6 +193,34 @@ def get_profile(path: Path, asin: str, domain: str) -> dict | None:
         d = dict(row)
         d["metric_config"] = json.loads(d.get("metric_config") or "{}")
         return d
+
+
+def profile_ai_prompt(path: Path, asin: str, domain: str) -> str:
+    """单链接的自定义 AI 解读规范(原样返回,可能为空串)。
+
+    刻意不走 get_profile:它会把 metric_config 一起 json.loads,库里若躺着
+    半写崩溃留下的坏 JSON,get_profile 抛异常会被调用方的 try/except 吞掉,
+    连带丢掉这个链接的 ai_prompt(降级成国家/全局规范)。这里只取一列原值。
+    """
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT ai_prompt FROM profiles WHERE asin=? AND domain=?",
+            (asin, domain)).fetchone()
+    return (row[0] or "") if row else ""
+
+
+def profile_display(path: Path, asin: str, domain: str) -> tuple[str, str]:
+    """某链接的展示身份 (model_number, url),供通知署名/做超链接用。
+
+    同样不走 get_profile:推送主路径不该被坏 metric_config 连累而整轮发不出。
+    """
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT model_number, url FROM profiles WHERE asin=? AND domain=?",
+            (asin, domain)).fetchone()
+    if not row:
+        return "", ""
+    return (row[0] or ""), (row[1] or "")
 
 
 def delete_profile(path: Path, asin: str, domain: str) -> None:
@@ -453,3 +490,109 @@ def clear_unconfirmed_anomalies(path: Path, asin: str, domain: str) -> int:
             "DELETE FROM anomalies WHERE asin=? AND domain=? AND confirmed=0",
             (asin, domain))
         return cur.rowcount
+
+
+# ---------- 通知去重状态(notify_state / review_push_state) ----------
+# 这两个状态表归 store 管(建表在 init_db);notify.py 只调这里的公开函数,
+# 不再 store._connect 穿墙手写 SQL(2026-09-14 解耦审计第 3 项)。
+
+def last_push(path: Path, asin: str, domain: str, metric: str) -> float:
+    """某 (asin, domain, metric) 上次推送时刻(秒级时间戳),从未推过返回 0。"""
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT pushed_at FROM notify_state "
+            "WHERE asin=? AND domain=? AND metric=?",
+            (asin, domain, metric)).fetchone()
+    return row[0] if row else 0.0
+
+
+def mark_pushed(path: Path, asin: str, domain: str, metric: str,
+                ts: float) -> None:
+    with _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO notify_state (asin, domain, metric, pushed_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(asin,domain,metric) "
+            "DO UPDATE SET pushed_at=excluded.pushed_at",
+            (asin, domain, metric, ts))
+
+
+def reviews_pushed(path: Path, asin: str, domain: str,
+                   hashes: list[str]) -> set:
+    """查这批差评哈希里哪些已经推送过。"""
+    if not hashes:
+        return set()
+    marks = ",".join("?" * len(hashes))
+    with _connect(path) as conn:
+        rows = conn.execute(
+            f"SELECT rhash FROM review_push_state "
+            f"WHERE asin=? AND domain=? AND rhash IN ({marks})",
+            [asin, domain] + list(hashes)).fetchall()
+    return {r[0] for r in rows}
+
+
+def mark_reviews_pushed(path: Path, asin: str, domain: str,
+                        hashes: list[str], ts: float) -> None:
+    """记这批差评哈希已推送(幂等:同哈希不覆盖首次时间)。"""
+    if not hashes:
+        return
+    with _connect(path) as conn:
+        conn.executemany(
+            """INSERT INTO review_push_state (asin, domain, rhash, pushed_at)
+               VALUES (?,?,?,?) ON CONFLICT(asin,domain,rhash) DO NOTHING""",
+            [(asin, domain, h, ts) for h in hashes])
+
+
+def unconfirmed_for_notify(path: Path, hours: float,
+                           limit: int = 500) -> list[dict]:
+    """静默窗口内的未确认异常,按严重级(critical>warning>info)、时间倒序。
+
+    notify_new_anomalies 的主体查询;hours 是"近 N 小时"窗口。
+    """
+    with _connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(
+            """SELECT * FROM anomalies
+               WHERE confirmed = 0
+                 AND checked_at >= datetime('now', 'localtime', ?)
+               ORDER BY CASE severity
+                 WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                 id DESC LIMIT ?""", (f"-{hours} hours", limit)).fetchall()]
+
+
+# ---------- 聊天机器人只读概况 ----------
+
+def monitor_overview(path: Path) -> dict:
+    """监控概况:总数 / 启用数 / 未确认异常数 + 异常按站点分布。"""
+    with _connect(path) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
+        enabled = conn.execute(
+            "SELECT COUNT(*) FROM profiles WHERE monitor_enabled=1").fetchone()[0]
+        anom = conn.execute(
+            "SELECT COUNT(*) FROM anomalies WHERE confirmed=0").fetchone()[0]
+        by_domain = conn.execute(
+            """SELECT domain, COUNT(*) FROM anomalies
+               WHERE confirmed=0 GROUP BY domain""").fetchall()
+    return {"total": total, "enabled": enabled, "unconfirmed": anom,
+            "anomalies_by_domain": [(d, c) for d, c in by_domain]}
+
+
+def unconfirmed_anomaly_rows(path: Path, limit: int = 40) -> list[dict]:
+    """未确认异常列表(带 profile 的型号名),聊天「列表」指令用。"""
+    with _connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(
+            """SELECT a.asin, a.domain, a.metric, a.old_value, a.new_value,
+                      p.model_number
+               FROM anomalies a
+               LEFT JOIN profiles p ON p.asin=a.asin AND p.domain=a.domain
+               WHERE a.confirmed=0
+               ORDER BY a.id DESC LIMIT ?""", (limit,)).fetchall()]
+
+
+def profiles_by_asin(path: Path, asin: str, limit: int = 1) -> list[dict]:
+    """跨站点按 ASIN 找 profile(聊天「查 B0…」不知道站点时用)。"""
+    with _connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(
+            """SELECT asin, domain, title, model_number, monitor_enabled
+               FROM profiles WHERE asin=? LIMIT ?""", (asin, limit)).fetchall()]

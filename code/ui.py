@@ -42,9 +42,12 @@ import weblogin
 import review_db
 import review_import
 import review_track
-from engine import STATUS_LABEL, ReviewChecker, parse_links
+import mockdata
+from engine import STATUS_LABEL, DOMAINS, ReviewChecker, parse_links
 from monitor import store as monitor_store
 from monitor import demo as monitor_demo
+# 站点显示映射全项目唯一一份在 monitor.model(此前 ui/board/notify/model 各抄一份)
+from monitor.model import DOMAIN_CC, short_domain as DOMAIN_SHORT
 
 DB = Path(__file__).parent / "history.db"
 MONITOR_DB = Path(__file__).parent / "monitor.db"
@@ -52,12 +55,6 @@ ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
 PROFILE_ROOT = Path.home() / ".amreview" / "profile"
 DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
            "amazon.com.au", "amazon.co.jp"]
-# 站点显示为两位国家码(US/UK/JP/...),未收录域名回退为去 amazon. 前缀
-DOMAIN_CC = {"amazon.com": "US", "amazon.co.uk": "UK", "amazon.de": "DE",
-             "amazon.co.jp": "JP", "amazon.com.au": "AU", "amazon.in": "IN",
-             "amazon.com.mx": "MX", "amazon.com.br": "BR", "amazon.es": "ES",
-             "amazon.it": "IT", "amazon.fr": "FR", "amazon.ca": "CA"}
-DOMAIN_SHORT = lambda d: DOMAIN_CC.get(d, d.replace("amazon.", ""))
 MAX_BATCH = 50
 
 STATUS_META = {  # status -> (中文, tailwind 药丸 class)
@@ -142,40 +139,15 @@ def link_cell(url: str) -> str:
 # 定时跟踪器与界面共用同一套 SQL,避免两处各写一份。
 
 
-def _db():
-    return review_db.connect()
-
-
-def init_db():
-    review_db.init_db()
-
-
-def save_history(results, auto_meta=True):
-    """写检测历史。auto_meta=True 时把新链接自动纳入每日跟踪队列。"""
-    review_db.save_history(results, auto_meta=auto_meta)
+# 数据层直接用 review_db(它本身就是 history.db 的唯一入口),不再写一层
+# 零价值转发包装 —— 2026-09-14 解耦审计第 5 项。例外是 last_status_map:
+# 它多做了"状态转中文标签",有真实职责。
 
 
 def last_status_map(refs):
     """结果页「上次检测」列:状态转中文标签。"""
     return {rid: (STATUS_LABEL.get(s, s), t)
             for rid, (s, t) in review_db.last_status_map(refs).items()}
-
-
-def recent_history(limit=500, days=None):
-    """检测历史(含台账里已登记但尚未检测过的链接,状态为空串 → 展示为「待检测」)。"""
-    return review_db.recent_history(limit, days)
-
-
-def history_stats(days=None):
-    return review_db.history_stats(days)
-
-
-def heat_stats():
-    return review_db.heat_stats()
-
-
-def review_history_timeline(review_id, limit=60):
-    return review_db.review_history_timeline(review_id, limit)
 
 
 def login_status():
@@ -227,199 +199,34 @@ def load_accounts():
 
 ACCOUNTS = load_accounts()
 
-# ---------- 演示数据(直接复用旧 app.py 的构造逻辑) ----------
-
-MOCK_RESULTS = [
-    {"review_id": "R1ALIVE1234", "domain": "amazon.com", "status": "alive",
-     "stars": "4", "title": "Great product, works as expected",
-     "author": "John D.", "review_date": "2026年8月10日", "body": "Worth every penny.",
-     "verified": True, "note": "", "shot_kind": "", "checked_at": "2026-08-22 03:00:05",
-     "url": "https://www.amazon.com/gp/customer-reviews/R1ALIVE1234/",
-     "prev_status": None, "prev_time": ""},
-    {"review_id": "R2DELETED6789", "domain": "amazon.in", "status": "deleted",
-     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
-     "verified": False, "note": "正常·08-1 HTTP 404 · Page Not Found",
-     "shot_kind": "deleted", "checked_at": "2026-08-22 03:00:00",
-     "url": "https://www.amazon.in/gp/customer-reviews/R2DELETED6789/",
-     "prev_status": "✅ 正常", "prev_time": "2026-08-22 02:00:30"},
-    {"review_id": "R3BLOCKED1111", "domain": "amazon.com.au", "status": "blocked",
-     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
-     "verified": False, "note": "重试 3 次仍被拦截(guard/captcha 拦截),建议稍后复测",
-     "shot_kind": "", "checked_at": "2026-08-22 02:30:00",
-     "url": "https://www.amazon.com.au/gp/customer-reviews/R3BLOCKED1111/",
-     "prev_status": None, "prev_time": ""},
-    {"review_id": "R4LOGIN2222", "domain": "amazon.co.jp", "status": "login_expired",
-     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
-     "verified": False, "note": "跳转登录页,需重新引导登录该站点 Amazon 账号",
-     "shot_kind": "", "checked_at": "2026-08-22 02:01:00",
-     "url": "https://www.amazon.co.jp/gp/customer-reviews/R4LOGIN2222/",
-     "prev_status": None, "prev_time": ""},
-    {"review_id": "R5UNKNOWN3333", "domain": "amazon.com.mx", "status": "unknown",
-     "stars": "", "title": "", "author": "", "review_date": "", "body": "",
-     "verified": False, "note": "已删·08-1 HTTP 200 · 无法识别的页面形态",
-     "shot_kind": "unknown", "checked_at": "2026-08-22 02:00:30",
-     "url": "https://www.amazon.com.mx/gp/customer-reviews/R5UNKNOWN3333/",
-     "prev_status": "🐕 已删", "prev_time": "2026-08-22 01:30:00"},
-    {"review_id": "R6ALIVE4444", "domain": "amazon.com.br", "status": "alive",
-     "stars": "5", "title": "Excelente produto!", "author": "Maria S.",
-     "review_date": "2026年8月5日", "body": "Recomendo.", "verified": False,
-     "note": "", "shot_kind": "", "checked_at": "2026-08-22 01:30:30",
-     "url": "https://www.amazon.com.br/gp/customer-reviews/R6ALIVE4444/",
-     "prev_status": None, "prev_time": ""},
-]
-
-
-def _mock_font(size):
-    from PIL import ImageFont
-    for p in ("/System/Library/Fonts/Helvetica.ttc",
-              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-              "/usr/share/fonts/dejavu/DejaVuSans.ttf"):
-        try:
-            return ImageFont.truetype(p, size)
-        except Exception:
-            pass
-    try:
-        return ImageFont.load_default(size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def _make_mock_shot(review_id, kind):
-    shot_dir = Path(__file__).parent / "screenshots"
-    shot_dir.mkdir(parents=True, exist_ok=True)
-    path = shot_dir / f"{review_id}_mock.png"
-    if path.exists():
-        return str(path)
-    try:
-        from PIL import Image, ImageDraw
-        W, H = 900, 400
-        img = Image.new("RGB", (W, H), (255, 255, 255))
-        d = ImageDraw.Draw(img)
-        d.rectangle([0, 0, W, 70], fill=(35, 47, 62))
-        d.rectangle([0, 0, 150, 70], fill=(68, 71, 85))
-        d.rectangle([160, 20, 300, 50], fill=(255, 255, 255))
-        d.rectangle([330, 20, 430, 50], fill=(255, 255, 255))
-        d.rectangle([120, 130, 780, 330], outline=(221, 221, 221), width=2)
-        d.rectangle([120, 130, 780, 210], fill=(160, 174, 192))
-        d.text((150, 158), "Sorry", fill=(255, 255, 255), font=_mock_font(36))
-        d.text((150, 240), "we couldn't find that page",
-               fill=(17, 94, 89), font=_mock_font(28))
-        d.text((150, 285), f"演示截图 · {review_id}", fill=(102, 102, 102),
-               font=_mock_font(16))
-        img.save(path)
-    except Exception:
-        pass
-    return str(path)
+# ---------- 演示数据 ----------
+# 数据构造、截图生成、history.db/monitor.db 读写全在 mockdata.py(与 app.py 共用
+# 一份)。这里只留"往本框架的会话存储写本轮结果"这一步 —— 那是框架相关的事。
 
 
 def load_mock_results():
-    results = []
-    for src in MOCK_RESULTS:
-        r = dict(src)
-        r["screenshot"] = _make_mock_shot(r["review_id"], r["shot_kind"]) \
-            if r["shot_kind"] else ""
-        r.pop("shot_kind", None)
-        r.pop("prev_status", None)
-        r.pop("prev_time", None)
-        results.append(r)
+    """载入演示结果:覆盖全状态/全站点,写入本轮结果与对比数据并展示。"""
+    results = mockdata.build_results()
     app.storage.user["results"] = results
-    app.storage.user["prev"] = {
-        m["review_id"]: (m["prev_status"], m["prev_time"])
-        for m in MOCK_RESULTS if m["prev_status"]}
-    save_history(results, auto_meta=False)   # 演示 ID 不进跟踪队列
-
-
-MOCK_HISTORY = [
-    ("R1ALIVEDDDD", "amazon.com.au", "alive", "5", "Excellent quality, fast shipping", "Tom H.", "2026-08-22 03:00:30"),
-    ("R1LOGINCCCC", "amazon.com", "login_expired", "", "", "", "2026-08-22 03:00:00"),
-    ("R1ALIVEBBBB", "amazon.com.mx", "alive", "5", "Muy buen producto, lo recomiendo", "Laura G.", "2026-08-22 02:30:30"),
-    ("R1BLOCKEDAAAA", "amazon.com", "blocked", "", "", "", "2026-08-22 02:30:00"),
-    ("R1UNKNOWN9999", "amazon.co.jp", "unknown", "", "", "", "2026-08-22 02:01:00"),
-    ("R1ALIVE8888", "amazon.in", "alive", "4", "बहुत अच्छा उत्पाद, धन्यवाद", "Priya S.", "2026-08-22 02:00:30"),
-    ("R9BLOCKED7777", "amazon.com.au", "blocked", "", "", "", "2026-08-22 02:00:00"),
-    ("R8DELETED6666", "amazon.com", "deleted", "", "", "", "2026-08-22 01:30:30"),
-    ("R7ALIVE5555", "amazon.com", "alive", "5", "Perfect, arrived on time", "Alex K.", "2026-08-22 01:30:00"),
-    ("R1ALIVE1234", "amazon.com", "alive", "4", "Great product, works as expected", "John D.", "2026-08-22 01:00:05"),
-    ("R2DELETED6789", "amazon.in", "deleted", "", "", "", "2026-08-22 01:00:00"),
-    ("R5ALIVE9999", "amazon.com.br", "alive", "5", "Produto excelente!", "Maria S.", "2026-08-21 20:30:00"),
-    ("R6ALIVE1212", "amazon.in", "alive", "4", "Good value for money", "Rohan V.", "2026-08-21 19:00:00"),
-    ("R7ALIVE3434", "amazon.co.jp", "alive", "5", "期待通りの商品でした", "佐藤", "2026-08-21 18:00:00"),
-    ("R4LOGIN2222", "amazon.co.jp", "login_expired", "", "", "", "2026-08-21 15:40:00"),
-    ("R9ALIVE7878", "amazon.com.au", "alive", "4", "Average quality, could be better", "Sam T.", "2026-08-20 10:05:00"),
-    ("R8ALIVE5656", "amazon.com", "alive", "5", "Fast delivery, happy", "Lily W.", "2026-08-20 09:00:00"),
-    ("R5UNKNOWN3333", "amazon.com.mx", "unknown", "", "", "", "2026-08-20 08:00:00"),
-]
-
-
-def _make_mock_history_rows(count=50):
-    statuses = ("alive", "alive", "deleted", "blocked", "login_expired", "unknown")
-    domains = tuple(DOMAINS)
-    titles = {
-        "alive": ("Reliable product, would buy again", "Good quality and quick delivery"),
-        "deleted": ("Review no longer available", "Page removed by the reviewer"),
-        "blocked": ("", ""),
-        "login_expired": ("", ""),
-        "unknown": ("", ""),
-    }
-    rows = []
-    for i in range(1, count + 1):
-        status = statuses[(i - 1) % len(statuses)]
-        title = titles[status][(i - 1) % len(titles[status])]
-        alive = status == "alive"
-        rows.append((
-            f"RMOCK{i:04d}",
-            domains[(i - 1) % len(domains)],
-            status,
-            str(3 + i % 3) if alive else "",
-            title,
-            f"Demo User {i:02d}" if alive else "",
-            f"2026-08-{22 - (i - 1) // 10:02d} {((i - 1) % 10) * 2:02d}:15:00",
-        ))
-    return rows
-
-
-MOCK_HISTORY.extend(_make_mock_history_rows())
-
-
-def load_mock_history():
-    ids = [h[0] for h in MOCK_HISTORY]
-    with _db() as conn:
-        conn.executemany("DELETE FROM history WHERE review_id = ?",
-                         [(i,) for i in ids])
-        conn.executemany(
-            """INSERT INTO history (review_id, domain, url, status, stars, title,
-               author, review_date, note, checked_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, '', '', ?)""",
-            [(rid, domain, f"https://www.{domain}/gp/customer-reviews/{rid}/",
-              status, stars, title, author, check_time)
-             for rid, domain, status, stars, title, author, check_time in MOCK_HISTORY])
-
-
-MOCK_IDS = tuple({r["review_id"] for r in MOCK_RESULTS}
-                 | {h[0] for h in MOCK_HISTORY})
-
-
-def _delete_mock_rows():
-    with _db() as conn:
-        conn.executemany("DELETE FROM history WHERE review_id = ?",
-                         [(i,) for i in MOCK_IDS])
+    app.storage.user["prev"] = mockdata.prev_map()
+    review_db.save_history(results, auto_meta=False)   # 演示 ID 不进跟踪队列
 
 
 def load_all_mock():
     load_mock_results()
-    load_mock_history()
-    monitor_demo.seed_demo(MONITOR_DB)
+    mockdata.load_history()
+    mockdata.seed_monitor(MONITOR_DB)
 
 
 def unload_all_mock():
     app.storage.user["results"] = []
     app.storage.user["tracking"] = []
     app.storage.user.pop("prev", None)
-    _delete_mock_rows()
-    monitor_store.delete_by_asins(MONITOR_DB, list(monitor_demo.TIMELINES))
+    mockdata.delete_rows()
+    mockdata.clear_monitor(MONITOR_DB)
 
 
-init_db()
+review_db.init_db()
 monitor_store.init_db(MONITOR_DB)   # 监控库补列迁移(bsr_cat/bsr_sub 等)在启动时跑
 
 # 应用内定时采集:后台守护线程,间隔/开关存 settings 表,UI 改完即生效
@@ -584,7 +391,7 @@ def page_check():
                             ui.notify(f"检测中断:{state['error']}", type="negative")
                         btn.props(remove="disable loading")
                         if results_new:
-                            save_history(results_new)
+                            review_db.save_history(results_new)
                             app.storage.user["results"] = results_new
                             app.storage.user["prev"] = prev
                         ui.navigate.to("/")
@@ -789,7 +596,7 @@ def detail_dialog(r: dict):
                       on_click=lambda u=r["url"]: ui.run_javascript(
                           f"window.open({json.dumps(u)}, '_blank')")) \
                 .props("outline no-caps dense icon=open_in_new")
-            if len(review_history_timeline(r["review_id"])) > 1:
+            if len(review_db.review_history_timeline(r["review_id"])) > 1:
                 ui.button("历史轨迹", on_click=lambda rid=r["review_id"]:
                           timeline_dialog(rid)) \
                     .props("outline no-caps dense")
@@ -802,7 +609,7 @@ def timeline_dialog(review_id: str):
     与抽屉里的跟踪历史同源同列,但独立成弹窗:检测页没有抽屉,
     点一次弹一次,关掉回到详情,不互相干扰。
     """
-    timeline = review_history_timeline(review_id)
+    timeline = review_db.review_history_timeline(review_id)
     with ui.dialog() as d, ui.card().classes("app-card w-[720px]"):
         with ui.row().classes("w-full items-center justify-between"):
             html(f'<div class="card-title">历史轨迹 · {review_id}</div>'
@@ -1375,7 +1182,7 @@ def page_history():
             cur["cc"] = "全部"
             cur["st"] = "all"
             rows_all.clear()
-            rows_all.extend(h_row(r) for r in recent_history(500, days["kw"]))
+            rows_all.extend(h_row(r) for r in review_db.recent_history(500, days["kw"]))
             apply_filter()
 
         # 搜索回车触发(与监控页一致)
@@ -1385,7 +1192,7 @@ def page_history():
 
 
 def stats_dialog(days):
-    stats = history_stats(days)
+    stats = review_db.history_stats(days)
     total = sum(c for _, c in stats) or 1
     with ui.dialog() as d, ui.card().classes("app-card w-[420px]"):
         html('<div class="card-title">历史状态统计</div>')
@@ -1468,9 +1275,9 @@ def _field_changed(getter, fmt, snap, prev) -> bool:
     """
     if prev is None:
         return False
-    from monitor.rules import _is_blank
+    from monitor.rules import is_blank
     rv, rp = getter(snap), getter(prev)
-    if _is_blank(rv) or _is_blank(rp):
+    if is_blank(rv) or is_blank(rp):
         return False
     return fmt(rv) != fmt(rp)
 
@@ -1482,7 +1289,7 @@ def _matrix_row(db_path, asin, domain, snap, anom_by_key) -> dict:
     残缺快照(风控页/加载不全,字段全空)必须跳过:否则首加链接第一轮
     落在风控页、第二轮抓到真数据,整行每格都从「空→有值」= 满屏「有更新」。
     """
-    from monitor.board import _status_label
+    from monitor.view import status_label
     from monitor.rules import snapshot_usable
     snaps = [s for s in monitor_store.snapshots_for(db_path, asin, domain, limit=6)
              if snapshot_usable(s)]
@@ -1518,7 +1325,7 @@ def _matrix_row(db_path, asin, domain, snap, anom_by_key) -> dict:
         if prev is None:
             row[f"chg_{key}"] = _CHG_BASE
         else:
-            g = (lambda s: _status_label(s.get("status"))) if key == "status" else getter
+            g = (lambda s: status_label(s.get("status"))) if key == "status" else getter
             f2 = (lambda v: v or "—") if key == "status" else fmt
             row[f"chg_{key}"] = _CHG_YES if _field_changed(g, f2, snap, prev) else _CHG_NO
     if a:
@@ -1648,7 +1455,7 @@ def page_monitor():
         title = p.get("title") or asin
         base = current_baseline(MONITOR_DB, asin, domain) or snaps[0]
         cur = snaps[-1]
-        from monitor.board import _diff_line, _status_label, _has_unconfirmed
+        from monitor.view import diff_line, has_unconfirmed, status_label
         drawer_body.clear()
         with drawer_body:
             with ui.row().classes("w-full items-center justify-between"):
@@ -1659,7 +1466,7 @@ def page_monitor():
                 ui.button(icon="close", on_click=field_drawer.hide) \
                     .props("flat round dense")
             html(f'<div class="pg-meta">基线 {(base.get("checked_at") or "")[5:16]} → '
-                 f'{(cur.get("checked_at") or "")[5:16]} · {_diff_line(base, cur)}</div>')
+                 f'{(cur.get("checked_at") or "")[5:16]} · {diff_line(base, cur)}</div>')
             ui.separator()
             # 操作区:商品页面 / 确认基线 / 删除监控(放在切卡上方,不用滚到底)
             # 注意这里是**商品**链接(ASIN 页),不是评价链接,所以不能跟着
@@ -1671,7 +1478,7 @@ def page_monitor():
                                   f"window.open({json.dumps(u)}, '_blank')")) \
                         .props("outline no-caps dense icon=open_in_new")
                 with ui.row().classes("items-center gap-2"):
-                    if _has_unconfirmed(MONITOR_DB, asin, domain):
+                    if has_unconfirmed(MONITOR_DB, asin, domain):
                         def _confirm():
                             from monitor.pipeline import confirm_and_move_baseline
                             confirm_and_move_baseline(MONITOR_DB, asin, domain)
@@ -1748,7 +1555,7 @@ def page_monitor():
                 for fk in fkeys:
                     k, lab, getter, fmt, kind = MON_BY_KEY[fk]
                     if k == "status":  # 原始状态码 → 中文标签
-                        getter = lambda s: _status_label(s.get("status"))
+                        getter = lambda s: status_label(s.get("status"))
                         fmt = lambda v: v or "—"
                     out.append((k, lab, getter, fmt, kind))
                 return out
@@ -1816,7 +1623,9 @@ def page_monitor():
         def refresh():
             ui.navigate.to("/monitor")
 
-        from monitor import board as monitor_board
+        # 看板数据/聚合走 monitor.view(纯逻辑层);别 import monitor.board ——
+        # 那是 Streamlit 渲染层,会把整个 streamlit 栈拖进本进程(见 view.py 说明)。
+        from monitor import view as monitor_view
 
         # 有数据 / 无数据共用同一套页头版式(以前空态另起一套,位置跳来跳去)
         has_data = (MONITOR_DB.exists()
@@ -1830,7 +1639,7 @@ def page_monitor():
             每次现取(切国家卡 / 采集后都要重算),别算一次就存着。
             """
             try:
-                return monitor_board.untracked_profiles(MONITOR_DB)
+                return monitor_view.untracked_profiles(MONITOR_DB)
             except Exception:
                 log.exception("读取「已添加未采集」的链接失败")
                 return []     # 读不出来不该让整页打不开
@@ -2004,7 +1813,7 @@ def page_monitor():
             # 每次都重取:跑一轮采集 / 添加链接 / 确认基线后,卡片与表格都是最新。
             # 也是「刷新」按钮的入口:重读库重画明细,不做整页跳转。
             _repaint["fn"] = rebuild
-            data_now = monitor_board.get_board_data(MONITOR_DB)
+            data_now = monitor_view.get_board_data(MONITOR_DB)
             counts = {}
             for domain in (k[1] for k in data_now["latest"]):
                 cc = DOMAIN_SHORT(domain)
@@ -2456,11 +2265,11 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
     from monitor import store as ms
     from monitor.pipeline import run_round_parallel
     from monitor.address import PlaywrightAdapter
-    from monitor.scheduler import _demo_asins
+    from monitor.scheduler import demo_asins
 
     # 演示 ASIN 跳过真实抓取(会把种子时间线打成脏数据)
     profs = [p for p in ms.list_profiles(MONITOR_DB)
-             if p["asin"] not in _demo_asins()]
+             if p["asin"] not in demo_asins()]
     if not profs:
         ui.notify("还没有监控链接,先点「添加监控」", type="warning")
         return
@@ -2732,7 +2541,7 @@ def login_dialog():
 
 
 def heat_dialog():
-    heat = heat_stats()
+    heat = review_db.heat_stats()
     with ui.dialog() as d, ui.card().classes("app-card w-[420px]"):
         html('<div class="card-title">IP 热度(近 24h)</div>')
         if not heat:

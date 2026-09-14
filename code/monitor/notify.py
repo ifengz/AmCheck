@@ -22,13 +22,8 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from . import store
+from .model import DOMAIN_CC
 from .rules import METRIC_LABELS
-
-# 域名 → 国家码(与 ui.py 的 DOMAIN_CC 保持一致;monitor 包不反向依赖 UI)
-DOMAIN_CC = {"amazon.com": "US", "amazon.co.uk": "UK", "amazon.de": "DE",
-             "amazon.co.jp": "JP", "amazon.com.au": "AU", "amazon.in": "IN",
-             "amazon.com.mx": "MX", "amazon.com.br": "BR", "amazon.es": "ES",
-             "amazon.it": "IT", "amazon.fr": "FR", "amazon.ca": "CA"}
 
 
 def _sign(secret: str, ts_ms: int) -> str:
@@ -189,53 +184,11 @@ def push_markdown(db_path, title: str, md: str) -> tuple[bool, str]:
     return _push_webhook(cfg, md, title=title, markdown=True)
 
 
-def _last_push(db_path, asin: str, domain: str, metric: str) -> float:
-    import sqlite3
-    with store._connect(db_path) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS notify_state (
-            asin TEXT, domain TEXT, metric TEXT, pushed_at REAL,
-            PRIMARY KEY (asin, domain, metric))""")
-        row = conn.execute(
-            "SELECT pushed_at FROM notify_state "
-            "WHERE asin=? AND domain=? AND metric=?",
-            (asin, domain, metric)).fetchone()
-    return row[0] if row else 0.0
-
-
 def _rhash(item: dict) -> str:
     """单条差评的身份哈希:标题+正文,忽略采集顺序/星级微调。"""
     import hashlib
     raw = f"{item.get('title', '')}\n{item.get('text', '')}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def _reviews_pushed(db_path, asin: str, domain: str,
-                    hashes: list[str]) -> set[str]:
-    """查这批差评哈希里哪些已经推送过。"""
-    if not hashes:
-        return set()
-    with store._connect(db_path) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS review_push_state (
-            asin TEXT, domain TEXT, rhash TEXT, pushed_at REAL,
-            PRIMARY KEY (asin, domain, rhash))""")
-        marks = ",".join("?" * len(hashes))
-        rows = conn.execute(
-            f"SELECT rhash FROM review_push_state "
-            f"WHERE asin=? AND domain=? AND rhash IN ({marks})",
-            [asin, domain] + hashes).fetchall()
-    return {r[0] for r in rows}
-
-
-def _mark_reviews_pushed(db_path, asin: str, domain: str,
-                         hashes: list[str]) -> None:
-    if not hashes:
-        return
-    import time as _t
-    with store._connect(db_path) as conn:
-        conn.executemany(
-            """INSERT INTO review_push_state (asin, domain, rhash, pushed_at)
-               VALUES (?,?,?,?) ON CONFLICT(asin,domain,rhash) DO NOTHING""",
-            [(asin, domain, h, _t.time()) for h in hashes])
 
 
 def _parse_bad_items(detail_raw) -> list[dict]:
@@ -250,18 +203,6 @@ def _parse_bad_items(detail_raw) -> list[dict]:
     except (ValueError, TypeError):
         pass
     return []
-
-
-def _mark_pushed(db_path, asin: str, domain: str, metric: str) -> None:
-    with store._connect(db_path) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS notify_state (
-            asin TEXT, domain TEXT, metric TEXT, pushed_at REAL,
-            PRIMARY KEY (asin, domain, metric))""")
-        conn.execute(
-            "INSERT INTO notify_state (asin, domain, metric, pushed_at) "
-            "VALUES (?,?,?,?) ON CONFLICT(asin,domain,metric) "
-            "DO UPDATE SET pushed_at=excluded.pushed_at",
-            (asin, domain, metric, time.time()))
 
 
 def notify_new_anomalies(db_path, round_anomaly_count: int,
@@ -286,16 +227,7 @@ def notify_new_anomalies(db_path, round_anomaly_count: int,
         configured = bool(cfg["webhook"])
     if not configured:
         return 0
-    import sqlite3
-    with store._connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        fresh = [dict(r) for r in conn.execute(
-            """SELECT * FROM anomalies
-               WHERE confirmed = 0
-                 AND checked_at >= datetime('now', 'localtime', ?)
-               ORDER BY CASE severity
-                 WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-                 id DESC""", (f"-{hours} hours",)).fetchall()]
+    fresh = store.unconfirmed_for_notify(db_path, hours)
     now = time.time()
     seen = set()
     groups = {}  # (asin, domain) -> [anomaly];组内保持严重级排序
@@ -310,14 +242,14 @@ def notify_new_anomalies(db_path, round_anomaly_count: int,
             # 全推过 → 跳过整条,绝不重复发旧差评。
             items = _parse_bad_items(a.get("detail"))
             hashes = [_rhash(x) for x in items]
-            done = _reviews_pushed(db_path, a["asin"], a["domain"], hashes)
+            done = store.reviews_pushed(db_path, a["asin"], a["domain"], hashes)
             fresh_items = [x for x, h in zip(items, hashes) if h not in done]
             fresh_hashes = [h for x, h in zip(items, hashes) if h not in done]
             if not fresh_items:
                 continue
             a["_new_items"] = fresh_items
             new_review_hashes[(a["asin"], a["domain"])] = fresh_hashes
-        elif now - _last_push(db_path, *key) < cfg["mute_h"] * 3600:
+        elif now - store.last_push(db_path, *key) < cfg["mute_h"] * 3600:
             continue  # 其他指标:静默期内不重复打扰
         groups.setdefault((a["asin"], a["domain"]), []).append(a)
     if not groups:
@@ -326,13 +258,10 @@ def notify_new_anomalies(db_path, round_anomaly_count: int,
     # ASIN 辨识名:只用页面上抓到的 Model Number(型号);抓不到就不显示名字。
     # 顺带取商品页 url,推送里 ASIN 做成可点链接
     names, urls = {}, {}
-    with store._connect(db_path) as conn:
-        for (asin, domain) in groups:
-            row = conn.execute(
-                "SELECT model_number, url FROM profiles "
-                "WHERE asin=? AND domain=?", (asin, domain)).fetchone()
-            names[(asin, domain)] = (row[0] or "").strip() if row else ""
-            urls[(asin, domain)] = (row[1] or "").strip() if row else ""
+    for (asin, domain) in groups:
+        model, url = store.profile_display(db_path, asin, domain)
+        names[(asin, domain)] = model.strip()
+        urls[(asin, domain)] = url.strip()
 
     def fmt_item(a) -> str:
         metric = METRIC_LABELS.get(a["metric"], a["metric"])
@@ -427,10 +356,12 @@ def notify_new_anomalies(db_path, round_anomaly_count: int,
         text += f"\n\n…还有 {len(ordered) - MAX_GROUPS} 个 ASIN"
     ok, _ = push_markdown(db_path, "AmCheck 监控告警", text)
     if ok:
+        push_ts = time.time()
         for items in groups.values():
             for a in items:
-                _mark_pushed(db_path, a["asin"], a["domain"], a["metric"])
+                store.mark_pushed(db_path, a["asin"], a["domain"],
+                                  a["metric"], push_ts)
         # 记本次推送过的差评哈希,下次同一条差评不再重复推
         for (asin, domain), hashes in new_review_hashes.items():
-            _mark_reviews_pushed(db_path, asin, domain, hashes)
+            store.mark_reviews_pushed(db_path, asin, domain, hashes, push_ts)
     return sum(len(v) for v in groups.values()) if ok else 0

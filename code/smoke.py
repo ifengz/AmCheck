@@ -98,7 +98,7 @@ def check_monitor():
             f"确认应只移除目标异常 {a['id']},实际剩余: {remaining_ids}"
         )
         # 5) 看板聚合正常
-        from monitor.board import get_board_data
+        from monitor.view import get_board_data
         data = get_board_data(db)
         assert data["total"] == 7
         assert data["abnormal_count"] >= 1

@@ -52,9 +52,12 @@ REVIEW_ID_PATTERNS = [
     re.compile(r"/portal/customer-reviews/srp/-/([A-Za-z0-9]{10,})"),
 ]
 DOMAIN_RE = re.compile(r"(amazon\.[a-z.\-]+)", re.IGNORECASE)
+# 支持的站点(有序 = 界面展示顺序)。**全项目唯一一份** —— 曾经 ui.py / app.py
+# 各抄一份、engine 里又有一份等价的无序 set,扩站点时必然漏改一处。
+DOMAINS = ["amazon.com", "amazon.com.mx", "amazon.com.br", "amazon.in",
+           "amazon.com.au", "amazon.co.jp"]
 # 站点 allowlist(评审项:防止构造任意 amazon.* 域名出站);扩站点时同步 accounts.json
-ALLOWED_DOMAINS = {"amazon.com", "amazon.com.mx", "amazon.com.br",
-                   "amazon.in", "amazon.com.au", "amazon.co.jp"}
+ALLOWED_DOMAINS = set(DOMAINS)
 
 DELETED_TEXTS = (
     "Looking for something?",

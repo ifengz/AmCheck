@@ -285,40 +285,40 @@ class UntrackedProfileTests(unittest.TestCase):
                 "'$9.99', 9.99)", (asin, domain))
 
     def test_profiles_without_snapshots_are_reported(self):
-        from monitor import board
+        from monitor import view
 
         self._add("B0AAAAAAAA")
         self._add("B0BBBBBBBB", domain="amazon.in")
-        self.assertEqual({p["asin"] for p in board.untracked_profiles(self.db)},
+        self.assertEqual({p["asin"] for p in view.untracked_profiles(self.db)},
                          {"B0AAAAAAAA", "B0BBBBBBBB"})
 
     def test_profile_with_a_snapshot_is_not_reported(self):
-        from monitor import board
+        from monitor import view
 
         self._add("B0AAAAAAAA")
         self._add("B0BBBBBBBB")
         self._snapshot("B0AAAAAAAA")
-        self.assertEqual([p["asin"] for p in board.untracked_profiles(self.db)],
+        self.assertEqual([p["asin"] for p in view.untracked_profiles(self.db)],
                          ["B0BBBBBBBB"])
 
     def test_disabled_profile_with_a_snapshot_is_not_reported(self):
         """停用但有快照的链接不算「未采集」。
 
-        别用 _latest_by_profile 反推 —— 它只遍历启用的 profile,会把这条误判成
+        别用 latest_by_profile 反推 —— 它只遍历启用的 profile,会把这条误判成
         未采集,于是页面上永远挂着一句「另有 N 条已添加未采集」。
         """
-        from monitor import board
+        from monitor import view
 
         self._add("B0AAAAAAAA", enabled=0)
         self._snapshot("B0AAAAAAAA")
-        self.assertEqual(board.untracked_profiles(self.db), [])
+        self.assertEqual(view.untracked_profiles(self.db), [])
 
     def test_disabled_profile_without_a_snapshot_is_reported(self):
         """停用且没快照的仍要认出来(中间态里标「已停用」),别静默吞掉。"""
-        from monitor import board
+        from monitor import view
 
         self._add("B0AAAAAAAA", enabled=0)
-        self.assertEqual([p["asin"] for p in board.untracked_profiles(self.db)],
+        self.assertEqual([p["asin"] for p in view.untracked_profiles(self.db)],
                          ["B0AAAAAAAA"])
 
 

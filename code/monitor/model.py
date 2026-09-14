@@ -17,6 +17,20 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+# 域名 → 两位国家码。**全项目唯一一份**,别在别处再抄一遍
+# (曾经 ui.py / board.py / notify.py / 本文件各有一份,改一处漏三处)。
+DOMAIN_CC = {"amazon.com": "US", "amazon.co.uk": "UK", "amazon.de": "DE",
+             "amazon.co.jp": "JP", "amazon.com.au": "AU", "amazon.in": "IN",
+             "amazon.com.mx": "MX", "amazon.com.br": "BR", "amazon.es": "ES",
+             "amazon.it": "IT", "amazon.fr": "FR", "amazon.ca": "CA"}
+
+
+def short_domain(domain: str) -> str:
+    """站点显示名:收录的走国家码,未收录的回退为去掉 amazon. 前缀。"""
+    if not domain:
+        return ""
+    return DOMAIN_CC.get(domain, str(domain).replace("amazon.", ""))
+
 
 @dataclass
 class ProductProfile:
@@ -140,12 +154,7 @@ def snapshot_to_dict(snap: SnapshotRecord) -> dict:
         return v
     return {
         "ASIN": snap.asin,
-        # 两位国家码显示,与 board.py 的 DOMAIN_CC 同一套映射
-        "站点": {"amazon.com": "US", "amazon.co.uk": "UK", "amazon.de": "DE",
-                 "amazon.co.jp": "JP", "amazon.com.au": "AU", "amazon.in": "IN",
-                 "amazon.com.mx": "MX", "amazon.com.br": "BR", "amazon.es": "ES",
-                 "amazon.it": "IT", "amazon.fr": "FR", "amazon.ca": "CA"}
-                .get(snap.domain, snap.domain.replace("amazon.", "")),
+        "站点": short_domain(snap.domain),
         "状态": snap.status,
         "标题": _cell(snap.title),
         "价格": _cell(snap.price),

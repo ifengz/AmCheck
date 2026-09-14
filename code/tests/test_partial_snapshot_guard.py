@@ -150,17 +150,17 @@ class FirstRoundGateTests(unittest.TestCase):
 
     def test_link_with_only_partial_shots_stays_untracked(self):
         """只有残缺拍 = 还没真正采到:留在「已添加未采集」,别从页面消失。"""
-        from monitor import board
+        from monitor import view
         run_round(self.db, ScriptedAdapter([_gate_snap("B0GATE0001", "amazon.com")]))
-        pend = board.untracked_profiles(self.db)
+        pend = view.untracked_profiles(self.db)
         self.assertEqual([p["asin"] for p in pend], ["B0GATE0001"])
-        data = board.get_board_data(self.db)
+        data = view.get_board_data(self.db)
         self.assertEqual(data["total"], 0, "残缺拍不进看板")
 
         run_round(self.db, ScriptedAdapter(
             [_full_snap("B0GATE0001", "amazon.com")]))
-        self.assertEqual(board.untracked_profiles(self.db), [])
-        self.assertEqual(board.get_board_data(self.db)["total"], 1)
+        self.assertEqual(view.untracked_profiles(self.db), [])
+        self.assertEqual(view.get_board_data(self.db)["total"], 1)
 
 
 class FieldFlapTests(unittest.TestCase):

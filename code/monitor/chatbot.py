@@ -20,7 +20,7 @@ import json
 import threading
 
 from . import store
-from .notify import DOMAIN_CC
+from .model import DOMAIN_CC
 
 HELP = ("AmCheck 监控助手,可用指令:\n"
         "· 状态 — 监控概况(总数/异常数)\n"
@@ -31,36 +31,23 @@ HELP = ("AmCheck 监控助手,可用指令:\n"
 
 def _overview(db_path) -> str:
     """监控概况:总数、启用数、未确认异常数、按站点分布。"""
-    with store._connect(db_path) as conn:
-        conn.row_factory = None
-        total = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
-        enabled = conn.execute(
-            "SELECT COUNT(*) FROM profiles WHERE monitor_enabled=1").fetchone()[0]
-        anom = conn.execute(
-            "SELECT COUNT(*) FROM anomalies WHERE confirmed=0").fetchone()[0]
-        rows = conn.execute(
-            """SELECT domain, COUNT(*) FROM anomalies
-               WHERE confirmed=0 GROUP BY domain""").fetchall()
+    o = store.monitor_overview(db_path)
     by_cc = ", ".join(
         f"{DOMAIN_CC.get(d, d.replace('amazon.', '').upper())} {c}"
-        for d, c in rows) or "无"
-    return (f"监控 {total} 条(启用 {enabled})· 未确认异常 {anom} 条\n"
+        for d, c in o["anomalies_by_domain"]) or "无"
+    return (f"监控 {o['total']} 条(启用 {o['enabled']})· "
+            f"未确认异常 {o['unconfirmed']} 条\n"
             f"异常分布:{by_cc}")
 
 
 def _list_anomalies(db_path, cc: str = "") -> str:
     """当前有未确认异常的 ASIN 列表,可按国家码过滤。"""
-    with store._connect(db_path) as conn:
-        rows = conn.execute(
-            """SELECT a.asin, a.domain, a.metric, a.old_value, a.new_value,
-                      p.model_number
-               FROM anomalies a
-               LEFT JOIN profiles p ON p.asin=a.asin AND p.domain=a.domain
-               WHERE a.confirmed=0
-               ORDER BY a.id DESC LIMIT 40""").fetchall()
+    rows = store.unconfirmed_anomaly_rows(db_path)
     from .rules import METRIC_LABELS
     out = []
-    for asin, domain, metric, old, new, model in rows:
+    for r in rows:
+        asin, domain, metric = r["asin"], r["domain"], r["metric"]
+        old, new, model = r["old_value"], r["new_value"], r["model_number"]
         site = DOMAIN_CC.get(domain, domain.replace("amazon.", "").upper())
         if cc and site != cc.upper():
             continue
@@ -76,13 +63,12 @@ def _list_anomalies(db_path, cc: str = "") -> str:
 def _check_asin(db_path, asin: str) -> str:
     """某个 ASIN 的最新快照 + 未确认异常。"""
     asin = asin.strip().upper()
-    with store._connect(db_path) as conn:
-        row = conn.execute(
-            """SELECT asin, domain, title, model_number, monitor_enabled
-               FROM profiles WHERE asin=? LIMIT 1""", (asin,)).fetchone()
-    if not row:
+    profs = store.profiles_by_asin(db_path, asin)
+    if not profs:
         return f"没找到 {asin} 的监控记录。先在监控页「添加监控」粘贴它的链接。"
-    _a, domain, title, model, enabled = row
+    row = profs[0]
+    domain, title, model, enabled = (row["domain"], row["title"],
+                                     row["model_number"], row["monitor_enabled"])
     site = DOMAIN_CC.get(domain, domain.replace("amazon.", "").upper())
     snap = store.latest_snapshot(db_path, asin, domain) or {}
     lines = [f"{asin} {model or ''} ({site}) {'监控中' if enabled else '已停用'}",
@@ -93,11 +79,9 @@ def _check_asin(db_path, asin: str) -> str:
             f"价格 {snap.get('price') or '—'} · 评分 {snap.get('rating') or '—'} · "
             f"评价数 {snap.get('review_count') or '—'} · "
             f"状态 {snap.get('status') or '—'}")
-    with store._connect(db_path) as conn:
-        anoms = conn.execute(
-            """SELECT metric, old_value, new_value FROM anomalies
-               WHERE asin=? AND confirmed=0 ORDER BY id DESC LIMIT 8""",
-            (asin,)).fetchall()
+    anoms = [(a["metric"], a["old_value"], a["new_value"])
+             for a in store.unconfirmed_anomalies(db_path)
+             if a["asin"] == asin][:8]
     if anoms:
         from .rules import METRIC_LABELS
         lines.append("未确认异常:")

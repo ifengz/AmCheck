@@ -47,7 +47,7 @@ def _new_bad_reviews(home: dict) -> int | None:
         return None
 
 
-def _is_blank(v) -> bool:
+def is_blank(v) -> bool:
     """字段这一拍「没读到」:None / 空串 / 空列表。"""
     return v is None or (isinstance(v, (str, list, dict)) and len(v) == 0)
 
@@ -61,7 +61,7 @@ def _stable_changed(old, new) -> bool:
     都按「这一拍没读到」处理,不报变化。真丢 BuyBox 基本都伴随可售性/
     页面状态变化,由 availability/status(非空字段)兜住。
     """
-    if _is_blank(old) or _is_blank(new):
+    if is_blank(old) or is_blank(new):
         return False
     return (str(old) != str(new))
 

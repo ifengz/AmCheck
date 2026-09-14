@@ -51,9 +51,9 @@ def log(msg: str) -> None:
 # ---------- 主流程 ----------
 
 def run_scheduled(domain_filter: str | None = None, parallel: bool = True) -> int:
-    from monitor.scheduler import _demo_asins
+    from monitor.scheduler import demo_asins
     profs = [p for p in (ms.list_profiles(DB) if DB.exists() else [])
-             if p["asin"] not in _demo_asins()]   # 演示 ASIN 不真实抓取
+             if p["asin"] not in demo_asins()]   # 演示 ASIN 不真实抓取
     if domain_filter:
         profs = [p for p in profs if p["domain"] == domain_filter]
     if not profs:

@@ -1,4 +1,4 @@
-"""monitor.board —— 链接监控统一看板(Streamlit 视图)。
+"""monitor.board —— 链接监控统一看板(**Streamlit 渲染层**)。
 
 对应架构文档 doc/06 §7。用 monitor 包的数据(不入 app.py 的 history.db),
 把"该盯的链接"以**一张直观表格**呈现:
@@ -7,7 +7,10 @@
 - 点选某行 → 弹窗看这条的变化史(历次快照)+ 当前 vs 基线对比 + 确认无误
 - 基线确认:异常行给"确认无误→前移基线"按钮(闭环关键操作)
 
-纯渲染,不碰写入;数据由调用方传入(依赖 board.get_board_data 聚合)。
+**本模块只做 Streamlit 渲染,不 import 任何非 Streamlit 的消费方。**
+数据聚合与展示整形在 monitor/view.py(纯逻辑、零框架依赖)——需要查询/整形
+请 import view,别 import 本模块,否则会把整个 Streamlit 栈拖进调用方进程
+(2026-09-14 解耦审计的根因,详见 view.py 顶部说明)。
 """
 
 from __future__ import annotations
@@ -16,121 +19,11 @@ import streamlit as st
 
 from . import store
 from .baseline import current_baseline
-from .rules import METRIC_LABELS, snapshot_usable
+from .model import short_domain
+from .view import (diff_line, get_board_data, has_unconfirmed, table_frame,
+                   table_row)
 
-_SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
-
-# 站点显示为两位国家码,与 ui.py 的 DOMAIN_SHORT 保持同一套映射
-DOMAIN_CC = {"amazon.com": "US", "amazon.co.uk": "UK", "amazon.de": "DE",
-             "amazon.co.jp": "JP", "amazon.com.au": "AU", "amazon.in": "IN",
-             "amazon.com.mx": "MX", "amazon.com.br": "BR", "amazon.es": "ES",
-             "amazon.it": "IT", "amazon.fr": "FR", "amazon.ca": "CA"}
-
-# monitor 用 alive/deleted/blocked/unavailable;engine 用 alive/deleted/blocked/
-# login_expired/unknown。统一映射,避免 unavailable 这类裸显成英文字符串。
-_STATUS_TEXT = {
-    "alive": "正常",
-    "deleted": "已删",
-    "blocked": "被拦截",
-    "unavailable": "下架",
-    "login_expired": "登录失效",
-    "unknown": "未知",
-}
-
-
-def _status_label(s: str | None) -> str:
-    """把两套状态词统一成中文标签;未知值原样返回。"""
-    if not s:
-        return "未知"
-    return _STATUS_TEXT.get(s, str(s))
-
-
-def _latest_by_profile(db_path) -> dict:
-    """{asin: 最新**可用**快照 dict}。只取启用的 profile。
-
-    残缺拍(风控页/加载不全)不当展示数据:最新一拍落在风控页时,
-    整行字段都是空的,看着像"数据丢了" —— 取最近一条抓到真数据的。
-    """
-    out = {}
-    for p in store.list_profiles(db_path):
-        s = store.latest_usable_snapshot(db_path, p["asin"], p["domain"],
-                                         snapshot_usable)
-        if s:
-            out[(p["asin"], p["domain"])] = s
-    return out
-
-
-def untracked_profiles(db_path) -> list[dict]:
-    """profiles 里还没有任何**可用**快照的链接,即「已添加、未采集」。
-
-    添加监控只写 profiles、不产生快照,而看板的数据源是快照 —— 不把这批
-    单独捞出来,用户加完链接在页面上看不出任何变化(空态时尤其明显:
-    页面照旧写着「还没有监控数据」),表现就是「点了添加没反应」。
-    只有残缺拍(第一轮全落在风控页)的链接同样没进看板,得留在这里,
-    否则用户以为链接加丢了。
-
-    **别用 _latest_by_profile 反推**:它只遍历启用的 profile,会把「停用但
-    有快照」的链接误判成未采集。这里直接按 profile 问有没有可用快照。
-    """
-    out = []
-    for p in store.list_profiles(db_path, only_enabled=False):
-        if not store.latest_usable_snapshot(db_path, p["asin"], p["domain"],
-                                            snapshot_usable):
-            out.append(p)
-    return out
-
-
-def _anomaly_rows(db_path) -> list[dict]:
-    """未确认异常(按严重度排序),每个 (asin, metric) 只保留最新一条(去重)。
-
-    架构文档 §6 的"去重"落地:同一指标的异常未确认前,后续每次检查都会再写一条,
-    但看板只展示最新一条,避免同一问题刷屏;确认后基线前移,该异常自然消失。
-    """
-    rows = []
-    seen: dict[tuple, dict] = {}
-    for a in store.unconfirmed_anomalies(db_path, limit=500):
-        key = (a["asin"], a["metric"])
-        # anomalies 返回按 id DESC,已是最新在前;保留每个 key 的第一条
-        if key in seen:
-            continue
-        seen[key] = a
-        p = store.get_profile(db_path, a["asin"], a["domain"])
-        rows.append({
-            "anomaly": a,
-            "title": (p or {}).get("title", a["asin"]),
-            "url": (p or {}).get("url", ""),
-        })
-    rows.sort(key=lambda r: _SEVERITY_RANK.get(r["anomaly"]["severity"], 9))
-    return rows
-
-
-def get_board_data(db_path) -> dict:
-    """聚合看板需要的全部数据(异常优先区 + 正常区 + 摘要)。"""
-    latest = _latest_by_profile(db_path)
-    anomalies = _anomaly_rows(db_path)
-    anom_keys = {(a["anomaly"]["asin"], a["anomaly"]["domain"]) for a in anomalies}
-
-    abnormal, normal = [], []
-    for (asin, domain), snap in latest.items():
-        row = {"asin": asin, "domain": domain, "snap": snap}
-        if (asin, domain) in anom_keys:
-            abnormal.append(row)
-        else:
-            normal.append(row)
-
-    def short(d):
-        return DOMAIN_CC.get(d, d.replace("amazon.", ""))
-    domains = sorted({short(d) for d in {k[1] for k in latest}})
-
-    return {
-        "latest": latest,
-        "anomalies": anomalies,
-        "abnormal": abnormal,
-        "normal": normal,
-        "domains": domains,
-        "total": len(latest),
-        "abnormal_count": len(abnormal),
-    }
+ALL_DOMAINS = "全部站点"
 
 
 def render(db_path) -> None:
@@ -147,10 +40,9 @@ def render(db_path) -> None:
                          f"监控 {data['total']} 条 · 异常 {data['abnormal_count']} 条")
     with right:
         doms = data["domains"]
-        ALL = "全部站点"
         left_c, right_c = st.columns([1.0, 0.9], vertical_alignment="center")
         with left_c:
-            sel = st.selectbox("站点", [ALL] + doms, key="mon_dom",
+            sel = st.selectbox("站点", [ALL_DOMAINS] + doms, key="mon_dom",
                                label_visibility="collapsed",
                                help="按国家/站点筛选,默认聚合所有站点")
         with right_c:
@@ -165,7 +57,7 @@ def render(db_path) -> None:
 
     # ── 聚合每行为 dict(最新快照 + 上次对比 + 异常徽标) ──
     def _in_domain(d, key_domain):
-        return sel == ALL or (DOMAIN_CC.get(key_domain, key_domain.replace("amazon.", "")) == d)
+        return sel == ALL_DOMAINS or short_domain(key_domain) == d
 
     def _match(row, qq):
         if not qq:
@@ -180,7 +72,7 @@ def render(db_path) -> None:
     for (asin, domain), snap in latest.items():
         if not _in_domain(sel, domain):
             continue
-        row = _table_row(db_path, asin, domain, snap, anom_by_key)
+        row = table_row(db_path, asin, domain, snap, anom_by_key)
         if _match(row, q):
             rows.append(row)
 
@@ -188,7 +80,7 @@ def render(db_path) -> None:
     rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
 
     # ── 摘要(基于筛选后):未加筛选时与标题副行重复,不重复展示 ──
-    filtered = sel != ALL or bool(q)
+    filtered = sel != ALL_DOMAINS or bool(q)
     abnormal = sum(1 for r in rows if r["_sev"] < 9)
     if filtered:
         st.markdown(
@@ -201,7 +93,7 @@ def render(db_path) -> None:
 
     # ── 点选行 → 弹窗 ──
     sel_state = st.dataframe(
-        _table_frame(rows), use_container_width=True, hide_index=True,
+        table_frame(rows), use_container_width=True, hide_index=True,
         row_height=28,
         height=min(1000, 40 + 28 * len(rows)),
         on_select="rerun", selection_mode="single-row",
@@ -229,80 +121,6 @@ def render(db_path) -> None:
         _history_dialog(db_path, asin, domain)
 
 
-def _table_row(db_path, asin: str, domain: str,
-               snap: dict, anom_by_key: dict) -> dict:
-    """把一条最新快照转成表格行 dict(带上次对比与异常徽标)。
-
-    私有字段用 _ 前缀(不下发到 dataframe),供排序与点选还原用。
-    """
-    snaps = store.snapshots_for(db_path, asin, domain, limit=2)
-    prev = snaps[-2] if len(snaps) >= 2 else None
-    a = anom_by_key.get((asin, domain))
-    sev = (a or {}).get("severity", "ok")
-
-    def fmt(v):
-        return "—" if v in (None, "") else v
-
-    status = snap.get("status") or "alive"
-    if prev:
-        pstatus, p_price = prev.get("status"), prev.get("price")
-        changed = (pstatus != status) or (p_price and p_price != snap.get("price"))
-        last = f"{'⚠ ' if changed else ''}{_status_label(pstatus)} · {fmt(p_price)}"
-        _ts = prev.get("checked_at") or ""
-    else:
-        last = "—"
-        _ts = ""
-
-    if a:
-        label = METRIC_LABELS.get(a["metric"], a["metric"])
-        # severity 映射徽标颜色
-        if sev == "critical":
-            badge = f"🚨 {label}"
-        elif sev == "warning":
-            badge = f"⚠ {label}"
-        else:
-            badge = f"ℹ {label}"
-    else:
-        badge = "正常"
-
-    cur_ts = snap.get("checked_at") or ""
-    ts_num = 0
-    try:
-        import datetime as _dt
-        ts_num = _dt.datetime.strptime(str(cur_ts).split(".")[0],
-                                       "%Y-%m-%d %H:%M:%S").timestamp()
-    except Exception:
-        ts_num = 0
-
-    return {
-        "异常": badge,
-        "状态": _status_label(status),
-        "ASIN": asin,
-        "站点": DOMAIN_CC.get(domain, domain.replace("amazon.", "")),
-        "标题": snap.get("title") or asin,
-        "价格": fmt(snap.get("price")),
-        "评分": fmt(snap.get("rating")),
-        "评价数": fmt(snap.get("review_count")),
-        "BuyBox": fmt(snap.get("buybox")),
-        "上下架": fmt(snap.get("availability")),
-        "上次": last,
-        "跟踪时间": (cur_ts or "")[5:16] or "—",
-        "原页面": (store.get_profile(db_path, asin, domain) or {}).get("url", ""),
-        # 私有字段
-        "_asin": asin,
-        "_domain": domain,
-        "_sev": _SEVERITY_RANK.get(sev, 9),
-        "_ts": ts_num,
-    }
-
-
-def _table_frame(rows: list[dict]) -> list[dict]:
-    """剥掉私有字段,只下发可展示列(顺序即表格列序)。"""
-    keys = ["异常", "状态", "ASIN", "站点", "标题", "价格", "评分", "评价数",
-            "BuyBox", "上下架", "上次", "跟踪时间", "原页面"]
-    return [{k: r[k] for k in keys} for r in rows]
-
-
 def _do_confirm(db_path, a: dict) -> None:
     """确认无误:把基线前移到该 ASIN 最新快照,并清掉该链路全部未确认异常。
 
@@ -328,7 +146,7 @@ def _history_dialog(db_path, asin: str, domain: str):
     title = (p or {}).get("title", asin)
 
     st.markdown(f"**{title}**  ·  {asin}  ·  "
-                f"{DOMAIN_CC.get(domain, domain.replace('amazon.', ''))}  ·  "
+                f"{short_domain(domain)}  ·  "
                 f"共 {len(snaps)} 次快照")
 
     # 当前 vs 基线对比:压缩为单行内联 diff(字段没变只显示一次,变了才显示 基线 → 当前)
@@ -337,7 +155,7 @@ def _history_dialog(db_path, asin: str, domain: str):
     t0 = (b.get("checked_at") or "")[5:16]
     t1 = (cur.get("checked_at") or "")[5:16]
     ts = f"{t0} → {t1}" if t0 != t1 else t1
-    st.markdown(f"`基线 {ts}`  ·  " + _diff_line(b, cur))
+    st.markdown(f"`基线 {ts}`  ·  " + diff_line(b, cur))
 
     st.divider()
     st.markdown("**变化史(历次快照)**")
@@ -361,7 +179,7 @@ def _history_dialog(db_path, asin: str, domain: str):
         if p and p.get("url"):
             st.link_button("打开原页面", p["url"], icon=":material/open_in_new:")
     with cols[1]:
-        if _has_unconfirmed(db_path, asin, domain):
+        if has_unconfirmed(db_path, asin, domain):
             if st.button("确认无误 → 前移基线",
                          icon=":material/verified:",
                          help="把基线前移到最新快照,并清掉该链路的未确认异常"):
@@ -369,31 +187,6 @@ def _history_dialog(db_path, asin: str, domain: str):
                     "asin": asin, "domain": domain, "id": 0})
         else:
             st.caption("该链路当前无未确认异常")
-
-
-def _has_unconfirmed(db_path, asin: str, domain: str) -> bool:
-    """某 ASIN 在当前站点是否有未确认异常(供弹窗判断要不要给确认按钮)。"""
-    for a in store.unconfirmed_anomalies(db_path, limit=500):
-        if a["asin"] == asin and a["domain"] == domain:
-            return True
-    return False
-
-
-def _diff_line(base: dict, cur: dict) -> str:
-    """压缩基线 vs 当前:字段没变只显示当前值,变了显示 基线 → 当前。
-    base/cur 是 store 查询的 dict 行,字段名即 snapshot 列名(price/rating/...)。"""
-    def _fmt(v):
-        return "—" if v in (None, "") else f"{v}"
-    parts = []
-    for label, key in (("价格", "price"), ("评分", "rating"), ("评价数", "review_count")):
-        ov, nv = _fmt(base.get(key)), _fmt(cur.get(key))
-        parts.append(f"{label} {' → '.join([ov, nv]) if ov != nv else nv}")
-    bb_o, bb_n = _fmt(base.get("buybox")), _fmt(cur.get("buybox"))
-    parts.append(f"BuyBox {' → '.join([bb_o, bb_n]) if bb_o != bb_n else bb_n}")
-    bad_o = (base.get("home_reviews") or {}).get("recent_bad", 0)
-    bad_n = (cur.get("home_reviews") or {}).get("recent_bad", 0)
-    parts.append(f"差评 {' → '.join([str(bad_o), str(bad_n)]) if bad_o != bad_n else str(bad_n)}")
-    return "  ·  ".join(parts)
 
 
 def _page_header(title: str, meta: str = ""):

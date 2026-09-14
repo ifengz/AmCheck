@@ -104,6 +104,22 @@ def save_history(results: list[dict], auto_meta: bool = True) -> None:
                     (row[1] or r.get("domain", ""), row[2] or r.get("url", ""), rid))
 
 
+def delete_history(review_ids) -> int:
+    """按 review_id 批量删除检测历史行,返回删除行数。
+
+    只给「卸载演示数据」用:演示 review_id 是固定的假 ID,不会与真实数据撞车。
+    此前 ui.py / app.py 各自手写 DELETE 语句 —— 按本项目约定,history.db 的
+    读写一律走本模块,别在界面层另写 SQL。
+    """
+    ids = [i for i in (review_ids or []) if i]
+    if not ids:
+        return 0
+    with connect() as conn:
+        cur = conn.executemany("DELETE FROM history WHERE review_id = ?",
+                               [(i,) for i in ids])
+        return cur.rowcount or 0
+
+
 def last_status_map(refs) -> dict:
     """这批 refs 各自最近一次的状态(结果页「上次检测」列)。"""
     if not refs or not DB.exists():

@@ -75,12 +75,8 @@ def resolve_prompt(db_path, asin: str, domain: str, cc: str) -> str:
     """
     custom = ""
     try:
-        with store._connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT ai_prompt FROM profiles WHERE asin=? AND domain=?",
-                (asin, domain)).fetchone() if domain else None
-        if row and (row[0] or "").strip():
-            custom = row[0].strip()
+        if domain:
+            custom = store.profile_ai_prompt(db_path, asin, domain).strip()
     except Exception:
         pass
     if not custom and cc:
