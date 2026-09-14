@@ -54,7 +54,7 @@ class MockAdapter(BaseAdapter):
     }
 
     def __init__(self, step: int = 1):
-        """step: 返回制造哪类状态的一拍。0=基线,1=价格-12%,2=丢BuyBox,
+        """step: 返回制造哪类状态的一拍。0=基线,1=价格-12%,2=BuyBox易主,
         3=新增差评,4=回到基线,>=5=上下架删除。"""
         self._step = step
 
@@ -86,7 +86,9 @@ def snapshot_for_step(asin: str, domain: str, url: str = "",
     elif step == 3:
         home_bad = 5                           # 新增差评
     elif step == 2:
-        buybox = ""                            # 丢 BuyBox
+        # BuyBox 易主(卖家换成另一家)。注意不能换成空串:「有值→空」
+        # 在真实数据里几乎都是解析抓漏,规则层不报(见 rules._stable_changed)
+        buybox = "ThirdPartySeller-X"
     elif step == 1:
         price = round(base_price * 0.88, 2)    # 价格 -12%
 

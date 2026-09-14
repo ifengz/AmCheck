@@ -364,6 +364,20 @@ def latest_snapshot(path: Path, asin: str, domain: str) -> dict | None:
     return snaps[-1] if snaps else None
 
 
+def latest_usable_snapshot(path: Path, asin: str, domain: str,
+                           is_usable) -> dict | None:
+    """最近一条「可用」快照(风控页/加载不全的残缺拍跳过)。
+
+    is_usable 由调用方传入(rules.snapshot_usable),store 不认识业务规则。
+    看板取这一条展示,避免最新一拍恰好是风控页时整行字段都是空的。
+    """
+    snaps = snapshots_for(path, asin, domain)
+    for s in reversed(snaps):
+        if is_usable(s):
+            return s
+    return None
+
+
 def count_snapshots(path: Path) -> int:
     with _connect(path) as conn:
         return conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
@@ -427,3 +441,15 @@ def unconfirmed_anomalies(path: Path, limit: int = 500) -> list[dict]:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM anomalies WHERE confirmed=0 ORDER BY id DESC LIMIT ?",
             (limit,)).fetchall()]
+
+
+def clear_unconfirmed_anomalies(path: Path, asin: str, domain: str) -> int:
+    """清掉某链接的全部未确认异常(基线被残缺快照污染后的自愈清理)。
+
+    只删 confirmed=0:用户确认过的异常是历史留痕,不动。
+    """
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "DELETE FROM anomalies WHERE asin=? AND domain=? AND confirmed=0",
+            (asin, domain))
+        return cur.rowcount

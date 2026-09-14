@@ -47,11 +47,50 @@ def _new_bad_reviews(home: dict) -> int | None:
         return None
 
 
+def _is_blank(v) -> bool:
+    """字段这一拍「没读到」:None / 空串 / 空列表。"""
+    return v is None or (isinstance(v, (str, list, dict)) and len(v) == 0)
+
+
 def _stable_changed(old, new) -> bool:
-    """稳定类:任何可见变化都算异常(标题/图片/BuyBox 自己不该动)。"""
-    if old is None:
+    """稳定类:任何可见变化都算异常(标题/图片/BuyBox 自己不该动)。
+
+    但「空」不算一个值:实测同一链接的 buybox/price 在「有值↔空」之间
+    反复跳(懒加载/A-B 版式/软风控只挡价格模块不挡整页),把空当值比就会
+    每跳一次报一次异常 —— 看板批量「丢失 BuyBox」的成因。任何一边是空,
+    都按「这一拍没读到」处理,不报变化。真丢 BuyBox 基本都伴随可售性/
+    页面状态变化,由 availability/status(非空字段)兜住。
+    """
+    if _is_blank(old) or _is_blank(new):
         return False
     return (str(old) != str(new))
+
+
+def snapshot_usable(snap: dict | None) -> bool:
+    """这条快照是不是"真的抓到了商品页"。
+
+    新监控链接的第一轮采集经常落在 Amazon 风控中间页("Continue shopping"
+    / 机器人墙),页面里什么都解析不到 → 全空字段。这种残缺快照一旦入库
+    还被设成基线,第二轮抓到真数据后价格/标题/BuyBox/状态全线"变化",
+    看板满屏假异常 —— 首加链接"一堆有更新"的根因。
+
+    判定取"最不可能同时缺失的正向信号":
+    - 有价格(含 0 价,下架页也可能挂价)或有评分/评价数 → 抓到商品主体;
+    - 明确 deleted/unavailable 的页面本身就是有效观测(上下架规则要用),
+      即使字段空也算可用;
+    - 只剩一个标题、其余全空 → 大概率是风控页/加载不完整,不可用。
+    """
+    if not snap:
+        return False
+    status = str(snap.get("status") or "")
+    if status in ("deleted", "unavailable"):
+        return True
+    # price_value 可能是 0(下架拍):用 is not None 判,别用真值
+    if snap.get("price_value") is not None or snap.get("price"):
+        return True
+    if snap.get("rating") is not None or snap.get("review_count") is not None:
+        return True
+    return False
 
 
 def detect_snapshot(profile: dict, baseline: dict | None,
@@ -298,7 +337,9 @@ def summarize(anomalies: list[dict]) -> list[dict]:
 
 
 METRIC_LABELS = {
-    "title": "标题", "buybox": "丢失 BuyBox", "variations": "变体",
+    # 只有两头都有值且不同才报(见 _stable_changed):真·丢 BuyBox(有值→空)
+    # 基本都伴随可售性/状态变化,由 availability/status 报,这里专管易主
+    "title": "标题", "buybox": "BuyBox 易主", "variations": "变体",
     "status": "在售状态", "price": "价格", "rating": "评分",
     "review_count": "评价数", "bsr": "排名", "deal_tag": "Deal",
     "home_reviews": "差评", "unavailable_period": "全程断货",

@@ -26,7 +26,8 @@ TIMELINES = {
         "parent_asin": "B0PARENT001",
         "steps": [0, 1, 1, 4],        # 基线→价-12%→价-12%回到基线
     },
-    # 丢 BuyBox:B0TRACK0002 BuyBox 从一个卖家换成空(被人抢走)
+    # BuyBox 易主:B0TRACK0002 BuyBox 从一个卖家换成另一个(真换卖家才报;
+    # 「换成空」会被规则层当抓漏忽略,见 rules._stable_changed)
     "B0TRACK0002": {
         "domain": "amazon.in", "url": "https://www.amazon.in/dp/B0TRACK0002/",
         "title": "Stainless Steel Water Bottle 1L",

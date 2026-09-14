@@ -276,10 +276,13 @@ class UntrackedProfileTests(unittest.TestCase):
             "url": f"https://{domain}/dp/{asin}", "monitor_enabled": enabled})
 
     def _snapshot(self, asin, domain="amazon.com"):
+        # 带 price_value 才是「可用快照」(rules.snapshot_usable):
+        # 只有 title 的空壳拍会被当成风控页残缺拍,不算采集成功
         with sqlite3.connect(self.db) as conn:
             conn.execute(
-                "INSERT INTO snapshots (asin, domain, checked_at, title) "
-                "VALUES (?, ?, '2026-09-14 10:00', 't')", (asin, domain))
+                "INSERT INTO snapshots (asin, domain, checked_at, title, "
+                "price, price_value) VALUES (?, ?, '2026-09-14 10:00', 't', "
+                "'$9.99', 9.99)", (asin, domain))
 
     def test_profiles_without_snapshots_are_reported(self):
         from monitor import board

@@ -16,7 +16,7 @@ import streamlit as st
 
 from . import store
 from .baseline import current_baseline
-from .rules import METRIC_LABELS
+from .rules import METRIC_LABELS, snapshot_usable
 
 _SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
 
@@ -46,28 +46,36 @@ def _status_label(s: str | None) -> str:
 
 
 def _latest_by_profile(db_path) -> dict:
-    """{asin: 最新快照 dict}。只取启用的 profile。"""
+    """{asin: 最新**可用**快照 dict}。只取启用的 profile。
+
+    残缺拍(风控页/加载不全)不当展示数据:最新一拍落在风控页时,
+    整行字段都是空的,看着像"数据丢了" —— 取最近一条抓到真数据的。
+    """
     out = {}
     for p in store.list_profiles(db_path):
-        s = store.latest_snapshot(db_path, p["asin"], p["domain"])
+        s = store.latest_usable_snapshot(db_path, p["asin"], p["domain"],
+                                         snapshot_usable)
         if s:
             out[(p["asin"], p["domain"])] = s
     return out
 
 
 def untracked_profiles(db_path) -> list[dict]:
-    """profiles 里还没有任何快照的链接,即「已添加、未采集」。
+    """profiles 里还没有任何**可用**快照的链接,即「已添加、未采集」。
 
     添加监控只写 profiles、不产生快照,而看板的数据源是快照 —— 不把这批
     单独捞出来,用户加完链接在页面上看不出任何变化(空态时尤其明显:
     页面照旧写着「还没有监控数据」),表现就是「点了添加没反应」。
+    只有残缺拍(第一轮全落在风控页)的链接同样没进看板,得留在这里,
+    否则用户以为链接加丢了。
 
     **别用 _latest_by_profile 反推**:它只遍历启用的 profile,会把「停用但
-    有快照」的链接误判成未采集。这里直接按 profile 问有没有快照。
+    有快照」的链接误判成未采集。这里直接按 profile 问有没有可用快照。
     """
     out = []
     for p in store.list_profiles(db_path, only_enabled=False):
-        if not store.latest_snapshot(db_path, p["asin"], p["domain"]):
+        if not store.latest_usable_snapshot(db_path, p["asin"], p["domain"],
+                                            snapshot_usable):
             out.append(p)
     return out
 

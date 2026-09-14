@@ -16,7 +16,7 @@ from .address import BaseAdapter, now_str
 from .baseline import current_baseline, ensure_baseline
 from .model import default_metric_config
 from . import store
-from .rules import detect_snapshot
+from .rules import detect_snapshot, snapshot_usable
 
 
 def run_round(db_path, adapter: BaseAdapter, profiles=None,
@@ -26,6 +26,10 @@ def run_round(db_path, adapter: BaseAdapter, profiles=None,
     返回 {"checked": n, "anomalies": n},供看板/调度展示。
     用 mock 适配器时,adapter.fetch 每次返回不同"拍",天然造历史。
     on_item(profile, checked, anomalies) 在每条处理完后回调(进度展示用)。
+
+    残缺快照(风控页/加载不全,价格评分全抓不到)只入库留档,
+    不设基线、不做对比 —— 否则首加链接第一轮落在风控页,第二轮
+    抓到真数据就会全线"有更新"+ 一堆假异常(首加误报的根因)。
     """
     store.init_db(db_path)
     profs = profiles if profiles is not None else store.list_profiles(db_path)
@@ -35,9 +39,18 @@ def run_round(db_path, adapter: BaseAdapter, profiles=None,
             continue
         snap = adapter.fetch(p["asin"], p["domain"], p.get("url", ""))
         snap_dict = snap.to_dict()   # 注意:to_dict 里 checked_at 已是 now
+        usable = snapshot_usable(snap_dict)
+        if not usable:
+            snap.note = "残缺快照(风控页/加载不完整),不参与对比与基线"
         snap_id = store.insert_snapshot(db_path, snap)
         checked += 1
         store.update_last_checked(db_path, p["asin"], p["domain"], snap.checked_at)
+        if not usable:
+            # 型号/变体/判定全部跳过:残缺页什么都不可信,
+            # 让下一轮成功采集来接管这条链接的基线与对比
+            if on_item:
+                on_item(p, 1, 0)
+            continue
         # 页面上抓到的型号回写 profile,推送/看板当 SKU 展示
         store.set_model_number(db_path, p["asin"], p["domain"],
                                getattr(snap, "model_number", ""))
@@ -50,8 +63,18 @@ def run_round(db_path, adapter: BaseAdapter, profiles=None,
         prev_snaps = store.snapshots_for(db_path, p["asin"], p["domain"])
         # 含刚写回的本条:period = 全部历史快照 = 该 ASIN 的观测期
         period_snaps = prev_snaps
-        prev = prev_snaps[-2] if len(prev_snaps) >= 2 else None
+        # 稳定类对比取「上一条可用快照」—— 残缺快照(风控页)当 prev
+        # 会把假变化(空→真值)报成异常,必须跳过
+        usable_snaps = [s for s in prev_snaps if snapshot_usable(s)]
+        prev = usable_snaps[-2] if len(usable_snaps) >= 2 else None
         base = current_baseline(db_path, p["asin"], p["domain"])
+
+        # 基线本身是残缺快照(修复前的旧数据):前移到本条,并清掉
+        # 由脏基线比出来的未确认异常,否则看板永远挂着一堆假异常
+        if base is not None and not snapshot_usable(base):
+            store.set_baseline(db_path, p["asin"], p["domain"], snap_id)
+            store.clear_unconfirmed_anomalies(db_path, p["asin"], p["domain"])
+            base = None
 
         # 首拍自动设基线(动态类才有对比对象)
         if base is None:
