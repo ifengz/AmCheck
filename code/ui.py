@@ -1732,6 +1732,19 @@ def page_monitor():
         has_data = (MONITOR_DB.exists()
                     and monitor_store.count_snapshots(MONITOR_DB) > 0)
 
+        def _pending():
+            """「已添加、还没采集」的链接:入库了,但一条快照都还没有。
+
+            看板的数据源是快照,而添加监控只写 profiles —— 不把这批单独捞出来,
+            加完链接页面上看不出任何变化,用户看到的就是「点了添加没反应」。
+            每次现取(切国家卡 / 采集后都要重算),别算一次就存着。
+            """
+            try:
+                return monitor_board.untracked_profiles(MONITOR_DB)
+            except Exception:
+                log.exception("读取「已添加未采集」的链接失败")
+                return []     # 读不出来不该让整页打不开
+
         # 页头:左「标题+副行摘要」,右搜索框(操作按钮下移到国家切卡同一行)
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2"):
             with ui.column().classes("gap-0"):
@@ -1770,6 +1783,33 @@ def page_monitor():
 
         if not has_data:
             # 空态只换正文区,页头/按钮位不动;给真实入口
+            pend = _pending()
+            if pend:
+                # 中间态:链接已入库,只是还没跑过采集。把链接本身列出来,
+                # 添加动作就立刻有了回执 —— 不用等采集、也不用靠 toast。
+                summary.set_content(
+                    f'<div class="pg-meta">已添加 {len(pend)} 条监控链接 · '
+                    '还没有采集数据</div>')
+                html('<div class="pg-meta" style="margin:8px 0 12px">'
+                     '链接已经在监控里了,点上方「跑一轮采集」抓一轮,'
+                     '看板就会长出来。</div>')
+                with ui.card().classes("app-card w-full"):
+                    for p in pend:
+                        with ui.row().classes("w-full items-center gap-3 no-wrap") \
+                                .style("padding:6px 2px;"
+                                       "border-bottom:1px solid #f1f5f9"):
+                            html(f'<span style="font-size:13px;font-weight:700;'
+                                 f'font-family:ui-monospace,Menlo,monospace;'
+                                 f'color:#1e293b">{p["asin"]}</span>'
+                                 f'<span class="pg-meta">'
+                                 f'{DOMAIN_SHORT(p["domain"])}</span>'
+                                 f'<span class="pg-meta" style="flex:1;min-width:0;'
+                                 f'overflow:hidden;text-overflow:ellipsis;'
+                                 f'white-space:nowrap">'
+                                 f'{html_mod.escape(p.get("url") or "")}</span>'
+                                 + ('' if p.get("monitor_enabled", 1) else
+                                    '<span class="pg-meta">已停用</span>'))
+                return
             summary.set_content('<div class="pg-meta">盯住产品页变化:价格 / 评分 / '
                                 '评价数 / 上下架</div>')
             html('<div class="pg-meta" style="margin:8px 0 12px">还没有监控数据:'
@@ -1859,9 +1899,14 @@ def page_monitor():
                     continue
                 rows.append(row)
             rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
+            # 新加的链接还没有快照,不会出现在下面的表里 —— 得单独说一句,
+            # 否则在有数据的页面上添加链接,用户同样会觉得「没反应」
+            pend = _pending()
+            extra = f' · 另有 {len(pend)} 条已添加未采集' if pend else ''
             summary.set_content(
                 f'<div class="pg-meta">监控 {data_now["total"]} 条 · 异常 '
-                f'{data_now["abnormal_count"]} 条 · 当前显示 {len(rows)} 条 · '
+                f'{data_now["abnormal_count"]} 条 · 当前显示 {len(rows)} 条'
+                f'{extra} · '
                 f'点 ASIN 或任意格看字段明细,点「产品」看文案全文</div>')
             grid_holder.clear()
             with grid_holder:
@@ -2121,6 +2166,11 @@ def schedule_dialog():
     d.open()
 
 
+# 添加监控成功后延后多久再刷新页面(秒)。刷新是 ui.navigate.to 整页跳转,
+# 会当场销毁刚发出的 toast —— 留一拍,「已添加 N 条监控」才看得见。
+ADD_MONITOR_REFRESH_DELAY = 1.5
+
+
 def add_monitor_dialog(on_done):
     """添加监控弹窗:粘贴 Amazon 商品页链接(或手填 ASIN),入库 profiles。"""
     with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
@@ -2134,38 +2184,80 @@ def add_monitor_dialog(on_done):
         ta.classes("w-full").props("outlined dense rows=5").style("font-size:13px")
         msg = ui.label("").classes("pg-meta")
 
+        def _fail(text):
+            """失败必须写在弹窗里并标红。
+
+            关掉弹窗 + 只把异常落服务端日志 = 用户看到「点了没反应」,
+            这正是这个弹窗最初被报障的成因。
+            """
+            msg.set_text(text)
+            msg.style("color:#b91c1c")
+
         def _add():
-            text = ta.value or ""
-            found, errs = [], []
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                # 域名与 /dp/ 之间可能有标题 slug(如 /LUXTER-Cordless.../dp/ASIN),
-                # 所以域名和 ASIN 分别单独匹配,不要求相邻
-                dm = re.search(r"amazon\.([a-z.]+?)(?:/|$|[?#])", line, re.I)
-                am = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:\b|[/?#]|$)", line, re.I)
-                if dm and am:
-                    found.append((am.group(1).upper(), f"amazon.{dm.group(1).lower()}", line))
-                else:
-                    errs.append(line)
-            if not found:
-                msg.set_text("未解析到有效商品链接(/dp/ASIN 格式)")
-                return
-            from monitor import store as ms
-            from monitor.pipeline import add_profile
-            added = skipped = 0
-            for asin, domain, url in found:
-                if ms.get_profile(MONITOR_DB, asin, domain):
-                    skipped += 1          # 已在监控中,不覆盖其配置
-                    continue
-                add_profile(MONITOR_DB, asin=asin, domain=domain, url=url)
-                added += 1
-            d.close()
-            ui.notify(f"已添加 {added} 条监控" +
-                      (f",跳过已存在 {skipped} 条" if skipped else ""),
-                      type="positive")
-            on_done()
+            """解析 → 入库 → 关窗 → 提示 → 刷新。
+
+            用户报的「添加完没反应」有两条成因,都在这里堵住:
+            1. 入库只写 profiles、不产生快照,而监控页的空态判定只看快照数,
+               于是刷新后页面纹丝不动 → 刷新改成延迟一拍,配合页面侧的
+               「已添加未采集」中间态(见 page_monitor),让结果一定看得见;
+            2. 任何异常以前只落服务端日志,界面上什么都不显示 → 全程 try,
+               失败写进弹窗并且**不关窗**(关了就等于没发生)。
+            """
+            try:
+                text = ta.value or ""
+                found, errs = [], []
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # 域名与 /dp/ 之间可能有标题 slug(如 /LUXTER-Cordless.../dp/ASIN),
+                    # 所以域名和 ASIN 分别单独匹配,不要求相邻
+                    dm = re.search(r"amazon\.([a-z.]+?)(?:/|$|[?#])", line, re.I)
+                    am = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:\b|[/?#]|$)", line, re.I)
+                    if dm and am:
+                        found.append((am.group(1).upper(), f"amazon.{dm.group(1).lower()}", line))
+                    else:
+                        errs.append(line)
+                if not found:
+                    msg.set_text("未解析到有效商品链接(/dp/ASIN 格式)")
+                    return
+                from monitor import store as ms
+                from monitor.pipeline import add_profile
+                # get_profile 不负责建表,全新库(第一次添加)里直接查会
+                # "no such table: profiles" —— 先 init_db 兜底
+                ms.init_db(MONITOR_DB)
+                added = skipped = 0
+                failed = []
+                for asin, domain, url in found:
+                    try:
+                        if ms.get_profile(MONITOR_DB, asin, domain):
+                            skipped += 1      # 已在监控中,不覆盖其配置
+                            continue
+                        add_profile(MONITOR_DB, asin=asin, domain=domain, url=url)
+                        added += 1
+                    except Exception as e:    # 单条坏掉不拖垮整批
+                        failed.append(f"{asin}@{DOMAIN_SHORT(domain)}"
+                                      f"({e.__class__.__name__})")
+                if not added and failed:
+                    _fail("添加失败:" + "、".join(failed))
+                    return
+                d.close()
+                parts = []
+                if added:
+                    parts.append(f"已添加 {added} 条监控")
+                if skipped:
+                    parts.append(f"跳过已存在 {skipped} 条")
+                if errs:
+                    parts.append(f"{len(errs)} 行没解析出 ASIN")
+                if failed:
+                    parts.append(f"{len(failed)} 条失败:" + "、".join(failed))
+                ui.notify(";".join(parts), type="positive" if added else "warning")
+                # 刷新走的是 ui.navigate.to(整页跳转),立刻执行会连刚发出的
+                # toast 一起冲掉 —— 延后一拍,让「已添加 N 条」真的看得见
+                ui.timer(ADD_MONITOR_REFRESH_DELAY, on_done, once=True)
+            except Exception as e:
+                log.exception("添加监控失败")
+                _fail(f"添加失败:{e.__class__.__name__}: {e}")
 
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("取消", on_click=d.close).props("outline no-caps dense")

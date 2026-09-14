@@ -55,6 +55,23 @@ def _latest_by_profile(db_path) -> dict:
     return out
 
 
+def untracked_profiles(db_path) -> list[dict]:
+    """profiles 里还没有任何快照的链接,即「已添加、未采集」。
+
+    添加监控只写 profiles、不产生快照,而看板的数据源是快照 —— 不把这批
+    单独捞出来,用户加完链接在页面上看不出任何变化(空态时尤其明显:
+    页面照旧写着「还没有监控数据」),表现就是「点了添加没反应」。
+
+    **别用 _latest_by_profile 反推**:它只遍历启用的 profile,会把「停用但
+    有快照」的链接误判成未采集。这里直接按 profile 问有没有快照。
+    """
+    out = []
+    for p in store.list_profiles(db_path, only_enabled=False):
+        if not store.latest_snapshot(db_path, p["asin"], p["domain"]):
+            out.append(p)
+    return out
+
+
 def _anomaly_rows(db_path) -> list[dict]:
     """未确认异常(按严重度排序),每个 (asin, metric) 只保留最新一条(去重)。
 
