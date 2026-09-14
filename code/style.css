@@ -141,3 +141,20 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 
 /* Review ID 格可点击复制:复制光标提示 */
 .ag-cell.rid-copy {cursor: copy;}
+
+/* 导入表格弹窗:解析结果预览小表 */
+.imp-wrap {max-height: 190px; overflow: auto; border: 1px solid var(--line);
+  border-radius: 8px; margin-top: 4px;}
+.imp-tb {width: 100%; border-collapse: collapse; font-size: 12px;}
+.imp-tb th {position: sticky; top: 0; background: #f8fafc; text-align: left;
+  font-weight: 700; color: var(--ink-sub); padding: 5px 8px;
+  border-bottom: 1px solid var(--line); white-space: nowrap;}
+.imp-tb td {padding: 4px 8px; border-bottom: 1px solid #f1f5f9; color: var(--ink);
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.imp-tb tr:last-child td {border-bottom: none;}
+
+/* 评价链接详情抽屉:业务字段三连(刷单编号/订单号/产品型号) */
+.field-cell {min-width: 96px;}
+.field-k {font-size: 11px; color: var(--ink-muted); letter-spacing: .3px;}
+.field-v {font-size: 13px; color: var(--ink); font-weight: 600;
+  word-break: break-all;}

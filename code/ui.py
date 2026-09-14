@@ -11,17 +11,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import html as html_mod
 import io
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,9 @@ import nicegui.ui as ui
 from nicegui import app, run
 
 import weblogin
+import review_db
+import review_import
+import review_track
 from engine import STATUS_LABEL, ReviewChecker, parse_links
 from monitor import store as monitor_store
 from monitor import demo as monitor_demo
@@ -54,9 +58,10 @@ STATUS_META = {  # status -> (中文, tailwind 药丸 class)
     "blocked": ("被拦截", "bg-[#fef3c7] text-[#b45309]"),
     "login_expired": ("登录失效", "bg-[#ede9fe] text-[#6d28d9]"),
     "unknown": ("未知", "bg-[#e2e8f0] text-[#475569]"),
+    "pending": ("待检测", "bg-[#e2e8f0] text-[#475569]"),
 }
 # 站点内展示顺序:问题状态(已删/被拦截/登录失效/未知)在前,正常在后
-STATUS_ORDER = ["deleted", "blocked", "login_expired", "unknown", "alive"]
+STATUS_ORDER = ["deleted", "blocked", "login_expired", "unknown", "alive", "pending"]
 
 with open(Path(__file__).parent / "style.css") as f:
     _css = f.read()
@@ -121,96 +126,45 @@ def link_cell(url: str) -> str:
             f'⧉</button>'
             f'</span>')
 
-# ---------- 数据层(与旧 app.py 相同的 SQL,平移过来) ----------
+# ---------- 数据层 ----------
+# history.db 的读写集中在 review_db(检测历史 + 评价链接台账 review_meta),
+# 定时跟踪器与界面共用同一套 SQL,避免两处各写一份。
 
 
 def _db():
-    return sqlite3.connect(DB, timeout=10)
+    return review_db.connect()
 
 
 def init_db():
-    with _db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS history (
-            review_id TEXT, domain TEXT, url TEXT, status TEXT,
-            stars TEXT, title TEXT, author TEXT, review_date TEXT,
-            note TEXT, checked_at TEXT)""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS tracking (
-            asin TEXT, domain TEXT, url TEXT, status TEXT,
-            title TEXT, price TEXT, rating TEXT, review_count TEXT,
-            availability TEXT, note TEXT, checked_at TEXT,
-            prev_status TEXT, prev_price TEXT, prev_time TEXT)""")
+    review_db.init_db()
 
 
-def save_history(results):
-    with _db() as conn:
-        conn.executemany(
-            """INSERT INTO history (review_id, domain, url, status, stars, title,
-               author, review_date, note, checked_at)
-               VALUES (:review_id, :domain, :url, :status, :stars, :title,
-                       :author, :review_date, :note, :checked_at)""",
-            results)
+def save_history(results, auto_meta=True):
+    """写检测历史。auto_meta=True 时把新链接自动纳入每日跟踪队列。"""
+    review_db.save_history(results, auto_meta=auto_meta)
 
 
 def last_status_map(refs):
-    if not refs or not DB.exists():
-        return {}
-    ids = [r.review_id for r in refs]
-    with _db() as conn:
-        rows = conn.execute(
-            """SELECT review_id, status, checked_at FROM history h
-               WHERE checked_at = (SELECT MAX(checked_at) FROM history
-                                   h2 WHERE h2.review_id = h.review_id)
-               AND review_id IN (%s)""" % ",".join("?" * len(ids)),
-            ids).fetchall()
-    return {rid: (STATUS_LABEL.get(s, s), t) for rid, s, t in rows}
+    """结果页「上次检测」列:状态转中文标签。"""
+    return {rid: (STATUS_LABEL.get(s, s), t)
+            for rid, (s, t) in review_db.last_status_map(refs).items()}
 
 
 def recent_history(limit=500, days=None):
-    if not DB.exists():
-        return []
-    where, params = "", []
-    if days:
-        where = "WHERE checked_at >= datetime('now', ?)"
-        params = [f"-{days} days"]
-    with _db() as conn:
-        return conn.execute(
-            f"""SELECT review_id, domain, url, status, stars, title,
-                author, review_date, note, checked_at
-                FROM history {where} ORDER BY checked_at DESC LIMIT ?""",
-            params + [limit]).fetchall()
+    """检测历史(含台账里已登记但尚未检测过的链接,状态为空串 → 展示为「待检测」)。"""
+    return review_db.recent_history(limit, days)
 
 
 def history_stats(days=None):
-    if not DB.exists():
-        return []
-    where, params = "", []
-    if days:
-        where = "WHERE checked_at >= datetime('now', ?)"
-        params = [f"-{days} days"]
-    with _db() as conn:
-        return conn.execute(
-            f"SELECT status, COUNT(*) FROM history {where} GROUP BY status",
-            params).fetchall()
+    return review_db.history_stats(days)
 
 
 def heat_stats():
-    if not DB.exists():
-        return []
-    with _db() as conn:
-        return conn.execute("""
-            SELECT domain, COUNT(*), SUM(status='blocked')
-            FROM history WHERE checked_at >= datetime('now','-1 day')
-            GROUP BY domain""").fetchall()
+    return review_db.heat_stats()
 
 
-def review_history_timeline(review_id, limit=20):
-    if not DB.exists():
-        return []
-    with _db() as conn:
-        return conn.execute(
-            """SELECT status, stars, title, checked_at FROM history
-               WHERE review_id = ? ORDER BY checked_at DESC LIMIT ?""",
-            (review_id, limit)).fetchall()
+def review_history_timeline(review_id, limit=60):
+    return review_db.review_history_timeline(review_id, limit)
 
 
 def login_status():
@@ -351,7 +305,7 @@ def load_mock_results():
     app.storage.user["prev"] = {
         m["review_id"]: (m["prev_status"], m["prev_time"])
         for m in MOCK_RESULTS if m["prev_status"]}
-    save_history(results)
+    save_history(results, auto_meta=False)   # 演示 ID 不进跟踪队列
 
 
 MOCK_HISTORY = [
@@ -452,6 +406,10 @@ from monitor.scheduler import Scheduler as _MonitorScheduler
 monitor_scheduler = _MonitorScheduler(MONITOR_DB)
 monitor_scheduler.start()
 
+# 评价链接每日跟踪:同样是后台守护线程,把全部链接分散到 24 小时里各查一次
+review_tracker = review_track.ReviewTracker(DB, MONITOR_DB)
+review_tracker.start()
+
 # ---------- 设计系统:可复用的小组件 ----------
 
 # ui.html 在 NiceGUI 3.x 必须显式给 sanitize;本应用的 html() 只承载
@@ -525,7 +483,14 @@ def page_check():
                 with ui.row().classes("w-full items-center justify-between"):
                     html('<div class="pg-meta">支持 /gp/customer-reviews/、/review/、'
                          'portal 三种格式</div>')
-                    btn = ui.button("开始检测", icon="play_arrow").props("unelevated no-caps")
+                    with ui.row().classes("items-center gap-2"):
+                        # 导入测评订单表格:评价链接自动进系统并纳入每日跟踪
+                        ui.button("导入表格", icon="upload_file",
+                                  on_click=lambda: import_table_dialog(
+                                      lambda: ui.navigate.to("/history"))) \
+                            .props("outline no-caps")
+                        btn = ui.button("开始检测", icon="play_arrow") \
+                            .props("unelevated no-caps")
 
                 def do_check():
                     refs = parse_links(ta.value or "")
@@ -768,11 +733,321 @@ def detail_dialog(r: dict):
     d.open()
 
 
+# ---------- 弹窗:导入测评订单表格 ----------
+
+
+def import_table_dialog(on_done=None):
+    """导入测评订单表格(xlsx/xls)。
+
+    取 刷单编号(A列) / 产品型号(D列) / 订单号(F列) / 测评链接(M列):
+    - 以有评价链接为首要条件:没有链接的行不加进来;
+    - 已加进来的不重复加,只把空的业务字段用表格数据补齐;
+    - 可选导入后立即跑一轮单次检测(与检测页同款逻辑),结果进检测历史。
+    """
+    state = {"rows": [], "stats": None}
+
+    with ui.dialog() as d, ui.card().classes("app-card w-[620px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">导入测评订单表格</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        html('<div class="pg-meta">读取表格的 <b>刷单编号(A列)</b>、'
+             '<b>产品型号(D列)</b>、<b>订单号(F列)</b>、<b>测评链接(M列)</b>。'
+             '没有评价链接的行不会加进来;已在系统里的链接不重复加,'
+             '只补齐它空着的业务字段。</div>')
+
+        preview = ui.column().classes("w-full gap-1")
+        msg = ui.label("").classes("pg-meta")
+
+        async def _on_upload(e):
+            # NiceGUI 的 UploadEventArguments.file 是 Starlette UploadFile:
+            # 异步 read();兜底读它内部的 SpooledTemporaryFile
+            up = getattr(e, "file", None)
+            raw = b""
+            if up is not None:
+                try:
+                    raw = await up.read()
+                except Exception:
+                    raw = b""
+                if not raw:
+                    inner = getattr(up, "file", None)
+                    if inner is not None:
+                        try:
+                            inner.seek(0)
+                            raw = inner.read()
+                        except Exception:
+                            raw = b""
+            if not raw:
+                msg.set_text("读取上传文件失败,请重新选择")
+                return
+            try:
+                rows, stats = review_import.parse_order_file(raw)
+            except ValueError as ex:
+                # review_import 抛的文案本身就是给用户看的(如旧版 .xls 提示)
+                state["rows"], state["stats"] = [], None
+                preview.clear()
+                msg.set_text(str(ex))
+                return
+            except Exception as ex:
+                state["rows"], state["stats"] = [], None
+                preview.clear()
+                msg.set_text(f"解析失败:{ex.__class__.__name__}: {ex}")
+                return
+            state["rows"], state["stats"] = rows, stats
+            msg.set_text("")
+            preview.clear()
+            with preview:
+                html(f'<div class="text-[13px]" style="font-weight:600">'
+                     f'{review_import.summarize(stats)}</div>')
+                if not rows:
+                    html('<div class="pg-meta">没有解析到带评价链接的行,'
+                         '请确认表格的 M 列是 Amazon 评价链接。</div>')
+                    return
+                head = ('<tr>' + ''.join(f'<th>{h}</th>' for h in
+                        ("刷单编号", "订单号", "产品型号", "评价链接"))
+                        + '</tr>')
+                body = ""
+                for r in rows[:6]:
+                    body += ('<tr>'
+                             + ''.join(f'<td>{html_mod.escape(str(r[k] or "—"))}</td>'
+                                       for k in ("order_ref", "order_no", "model"))
+                             + f'<td>{html_mod.escape(r["url"])}</td></tr>')
+                more = (f'<div class="pg-meta">…另有 {len(rows) - 6} 条</div>'
+                        if len(rows) > 6 else "")
+                html('<div class="imp-wrap"><table class="imp-tb">'
+                     + head + body + '</table></div>' + more)
+
+        ui.upload(label="选择 .xlsx / .xls 文件", auto_upload=True,
+                  max_file_size=20_000_000, on_upload=_on_upload) \
+            .props('accept=".xlsx,.xls" flat bordered').classes("w-full")
+
+        immediate = ui.switch("导入后立即检测一轮(单次)", value=True)
+
+        prog_row = ui.row().classes("w-full")
+        with prog_row:
+            prog = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
+            prog_text = ui.label("").classes("pg-meta")
+        prog_row.set_visibility(False)
+
+        async def _confirm():
+            rows = state["rows"]
+            if not rows:
+                msg.set_text("请先选择一个表格文件")
+                return
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for r in rows:
+                r["created_at"] = stamp
+            stat = review_db.upsert_review_meta(rows, source="table")
+            summary = (f'已加入 {stat["added"]} 条新链接 · 回填业务字段 '
+                       f'{stat["filled"]} 条 · 已存在 {stat["unchanged"]} 条')
+            if not immediate.value:
+                d.close()
+                ui.notify(summary + ",已纳入每日定时跟踪", type="positive")
+                if on_done:
+                    on_done()
+                return
+
+            refs = parse_links("\n".join(r["url"] for r in rows))
+            if not refs:
+                d.close()
+                ui.notify(summary, type="positive")
+                if on_done:
+                    on_done()
+                return
+            confirm_btn.props("disable loading")
+            prog_row.set_visibility(True)
+            prog.set_value(0)
+            prog_text.set_text(f"准备检测 {len(refs)} 条…")
+            state_now = {"done": 0, "tally": {}, "error": ""}
+
+            def _work():
+                checker = ReviewChecker()
+
+                def on_result(i, ref, r):
+                    state_now["done"] = i + 1
+                    t = state_now["tally"]
+                    t[r["status"]] = t.get(r["status"], 0) + 1
+                try:
+                    return checker.check_batch(refs, on_result=on_result)
+                finally:
+                    checker.close()
+
+            def _poll():
+                prog.set_value(state_now["done"] / len(refs))
+                tally = " · ".join(
+                    f"{STATUS_LABEL.get(s, s)} {n}"
+                    for s, n in sorted(state_now["tally"].items(), key=lambda kv: -kv[1]))
+                prog_text.set_text(f"[{state_now['done']}/{len(refs)}] {tally}")
+
+            timer = ui.timer(0.2, _poll)
+            try:
+                results_new = await run.io_bound(_work)
+            except Exception as ex:
+                state_now["error"] = f"{ex.__class__.__name__}: {ex}"
+                results_new = []
+            timer.cancel()
+            if results_new:
+                review_db.save_history(results_new)
+                for r in results_new:
+                    review_db.update_track_state(r["review_id"], r["status"],
+                                                 r["checked_at"])
+            d.close()
+            tail = (f",检测 {len(results_new)} 条" if results_new
+                    else (f",检测中断:{state_now['error']}" if state_now["error"] else ""))
+            ui.notify(summary + tail + " · 已纳入每日定时跟踪", type="positive")
+            if on_done:
+                on_done()
+
+        with ui.row().classes("w-full justify-end gap-2 mt-1"):
+            ui.button("取消", on_click=d.close).props("outline no-caps dense")
+            confirm_btn = ui.button("导入", on_click=_confirm) \
+                .props("unelevated no-caps dense color=primary")
+    d.open()
+
+
+# ---------- 弹窗:评价链接详情(检测历史右侧抽屉) ----------
+
+
+def fill_review_drawer(body, drawer, review_id, on_refresh=None):
+    """抽屉内容:这个评价链接的档案 + 按日期的跟踪历史。
+
+    与检测页的详情弹窗同源,但补上业务字段(刷单编号/订单号/产品型号)、
+    跟踪状态(跟踪中 / 已停止)与逐日轨迹,信息一次看全。
+    """
+    meta = review_db.get_meta(review_id) or {}
+    domain = meta.get("domain") or ""
+    url = meta.get("url") or ""
+    timeline = review_db.review_history_timeline(review_id, limit=60)
+    tracked = bool(meta.get("track_enabled", 1))
+
+    body.clear()
+    with body:
+        with ui.row().classes("w-full items-center justify-between"):
+            with ui.column().classes("gap-0"):
+                html(f'<div class="card-title">评价链接详情</div>'
+                     f'<div class="pg-meta">{review_id} · '
+                     f'{DOMAIN_SHORT(domain) if domain else "未知站点"}</div>')
+            ui.button(icon="close", on_click=drawer.hide).props("flat round dense")
+
+        # 业务字段:表格来的有值,直接粘链接来的显示「—」
+        with ui.row().classes("w-full gap-6 items-start"):
+            for label, key in (("刷单编号", "order_ref"), ("订单号", "order_no"),
+                               ("产品型号", "model")):
+                v = str(meta.get(key) or "").strip()
+                html(f'<div class="field-cell"><div class="field-k">{label}</div>'
+                     f'<div class="field-v">{html_mod.escape(v) if v else "—"}</div></div>')
+
+        if tracked:
+            tag = ('<span class="pill bg-[#dcfce7] text-[#15803d]">跟踪中</span>')
+        else:
+            tag = ('<span class="pill bg-[#fee2e2] text-[#b91c1c]">已停止</span>')
+        reason = meta.get("stop_reason") or ""
+        html(f'<div class="pg-meta" style="display:flex;gap:8px;align-items:center">'
+             f'{tag}<span>已跟踪 {meta.get("track_count", 0)} 次 · '
+             f'连续已删 {meta.get("deleted_streak", 0)} 次'
+             f'{" · " + html_mod.escape(reason) if reason else ""}'
+             f' · 上次 {html_mod.escape((meta.get("last_tracked_at") or "未跟踪"))}'
+             f'</span></div>')
+        html('<div class="pg-meta">每日定时跟踪一次,全部链接分散在 24 小时内轮流检测;'
+             '连续 5 次判定为已删(变狗)会自动停止跟踪。</div>')
+
+        with ui.row().classes("items-center gap-2"):
+            if url:
+                ui.button("打开原页面", on_click=lambda u=url: ui.open(u, new_tab=True)) \
+                    .props("outline no-caps dense icon=open_in_new")
+                ui.button("复制链接",
+                          on_click=lambda u=url: (
+                              ui.run_javascript(
+                                  f"copyText({json.dumps(u)});showCopyToast('链接已复制')"))) \
+                    .props("outline no-caps dense icon=content_copy")
+            check_btn = ui.button("立即检测一次", icon="play_arrow") \
+                .props("unelevated no-caps dense color=primary")
+
+            async def _check_now():
+                refs = parse_links(url)
+                if not refs:
+                    ui.notify("这条链接无法解析", type="negative")
+                    return
+                check_btn.props("disable loading")
+
+                def _work():
+                    checker = ReviewChecker()
+                    try:
+                        return checker.check_batch(refs)
+                    finally:
+                        checker.close()
+                try:
+                    res = await run.io_bound(_work)
+                except Exception as ex:
+                    ui.notify(f"检测失败:{ex.__class__.__name__}: {ex}",
+                              type="negative")
+                    check_btn.props(remove="disable loading")
+                    return
+                review_db.save_history(res)
+                for r in res:
+                    review_db.update_track_state(r["review_id"], r["status"],
+                                                 r["checked_at"])
+                check_btn.props(remove="disable loading")
+                if res:
+                    st = STATUS_LABEL.get(res[0]["status"], res[0]["status"])
+                    ui.notify(f"检测完成:{st}", type="positive")
+                fill_review_drawer(body, drawer, review_id, on_refresh)
+                if on_refresh:
+                    on_refresh()
+
+            check_btn.on("click", _check_now)
+
+            def _toggle_track():
+                review_db.set_track_enabled(review_id, not tracked)
+                ui.notify("已恢复跟踪" if not tracked else "已停止跟踪",
+                          type="positive")
+                fill_review_drawer(body, drawer, review_id, on_refresh)
+                if on_refresh:
+                    on_refresh()
+            ui.button("恢复跟踪" if not tracked else "停止跟踪",
+                      on_click=_toggle_track).props("outline no-caps dense")
+
+        ui.separator()
+        html(f'<div class="card-title" style="font-size:14px">'
+             f'按日期的跟踪历史({len(timeline)} 次)</div>')
+        if not timeline:
+            ui.label("还没有检测记录。点「立即检测一次」,或等每日定时跟踪跑到它。") \
+                .classes("pg-meta")
+            return
+        rows = []
+        for t in timeline:
+            rows.append({
+                "checked": t["checked_at"],
+                "status_text": status_text(t["status"]),
+                "stars": stars_html(t["stars"]),
+                "title": t["title"] or "—",
+                "note": t["note"] or "—",
+                "_status": t["status"],
+            })
+        ui.aggrid({
+            "columnDefs": [
+                {"headerName": "检测时间", "field": "checked", "width": 158},
+                {"headerName": "状态", "field": "status_text", "width": 78},
+                {"headerName": "星级", "field": "stars", "width": 64},
+                {"headerName": "标题", "field": "title", "minWidth": 140, "flex": 2},
+                {"headerName": "判定依据", "field": "note", "minWidth": 140, "flex": 2},
+            ],
+            "rowData": rows,
+            "defaultColDef": {"sortable": True, "resizable": True},
+            "rowHeight": 28,
+        }, html_columns=[1, 2]).classes("w-full ag-dense").style("height:320px")
+
+
 # ---------- 页面:历史 ----------
 
 
 @ui.page("/history")
 def page_history():
+    # 右侧抽屉:点任一条记录 → 看这个评价链接的档案(刷单编号/订单号/产品型号)
+    # 与按日期的跟踪历史。q-drawer 属顶层布局元素,必须建在页面函数体里。
+    with ui.drawer("right", value=False, bordered=True) as rev_drawer:
+        rev_drawer.props("width=880 breakpoint=9999")
+        rev_body = ui.column().classes("w-full gap-2 p-4")
+
     with build_shell("/history"):
         days = {"kw": 7}
         # 切卡筛选:国家 + 状态(全部/正常/已删),数据在前端按已加载行过滤
@@ -797,6 +1072,10 @@ def page_history():
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
             cards_row = ui.row().classes("items-center gap-2 flex-grow")
             with ui.row().classes("items-center gap-2 flex-none"):
+                # 导入测评订单表格:刷单编号/产品型号/订单号随评价链接一起进系统
+                ui.button("导入表格", icon="upload_file",
+                          on_click=lambda: import_table_dialog(load_rows)) \
+                    .props("unelevated no-caps dense color=primary")
                 # 时间范围:三个独立按钮,选中态 = 浅蓝底+蓝字(非实心,与空心按钮同族)
                 # 四个按钮锁同宽,字数不齐也排整齐;80px 给左侧 10 张切卡腾位
                 range_btns = {}
@@ -816,19 +1095,31 @@ def page_history():
                     .props("outline no-caps dense").classes("w-[80px]")
 
         def h_row(r):
-            rid, domain, url, status, stars, title, author, review_date, note, checked = r
+            rid = r["review_id"]
+            url = r["url"] or f"https://www.{r['domain']}/gp/customer-reviews/{rid}/"
+            status = r["status"] or "pending"   # 台账里有、但还没检测过的链接
+            tracked = bool(r.get("track_enabled", 1))
             return {
-                "checked": checked, "review_id": rid, "domain": DOMAIN_SHORT(domain),
-                "link": link_cell(url or f"https://www.{domain}/gp/customer-reviews/{rid}/"),
+                "checked": r["checked_at"] or "",
+                "review_id": rid,
+                "order_ref": r.get("order_ref") or "—",
+                "order_no": r.get("order_no") or "—",
+                "model": r.get("model") or "—",
+                "link": link_cell(url),
+                "domain": DOMAIN_SHORT(r["domain"]),
                 "status_text": status_text(status),
-                "stars": stars_html(stars),
-                "title": title or "—",
-                "author": author or "—",
-                "review_date": review_date or "—",
-                "note": note or "—",
+                "track": "跟踪中" if tracked else "已停止",
+                "stars": stars_html(r["stars"]),
+                "title": r["title"] or "—",
+                "author": r["author"] or "—",
+                "review_date": r["review_date"] or "—",
+                "note": r["note"] or ("尚未检测,等每日定时跟踪跑到它"
+                                      if not r["status"] else "—"),
                 "_status": status,
-                # 搜索索引:原始字段小写拼接(ID/URL/标题/作者/备注),显示用的"—"不参与
-                "_hay": " ".join((x or "").lower() for x in (rid, url, title, author, note)),
+                # 搜索索引:原始字段小写拼接(ID/URL/业务字段/标题/作者/备注)
+                "_hay": " ".join(str(x or "").lower() for x in
+                                 (rid, url, r.get("order_ref"), r.get("order_no"),
+                                  r.get("model"), r["title"], r["author"], r["note"])),
             }
 
         def set_meta(n):
@@ -901,9 +1192,13 @@ def page_history():
                 {"headerName": "Review ID", "field": "review_id", "width": 148,
                  "pinned": "left", "tooltipField": "review_id",
                  "cellClass": "rid-copy"},
+                {"headerName": "刷单编号", "field": "order_ref", "width": 92},
+                {"headerName": "订单号", "field": "order_no", "width": 170},
+                {"headerName": "产品型号", "field": "model", "width": 180},
                 {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
                 {"headerName": "站点", "field": "domain", "width": 62},
-                {"headerName": "状态", "field": "status_text", "width": 78},
+                {"headerName": "状态", "field": "status_text", "width": 84},
+                {"headerName": "跟踪", "field": "track", "width": 76},
                 {"headerName": "星级", "field": "stars", "width": 66},
                 {"headerName": "标题", "field": "title", "minWidth": 160, "flex": 3},
                 {"headerName": "作者", "field": "author", "width": 90},
@@ -913,13 +1208,22 @@ def page_history():
             "rowData": [],
             "defaultColDef": {"sortable": True, "resizable": True},
             "rowHeight": 30,
-        }, html_columns=[2, 4, 5]).classes("w-full ag-dense ag-fill")
+        }, html_columns=[5, 7, 9]).classes("w-full ag-dense ag-fill")
 
-        # 点 Review ID 格 = 复制完整 ID(显示截断不影响)
-        grid.on("cellClicked", lambda e: ui.run_javascript(
-            f"copyText({json.dumps(e.args['data']['review_id'])});"
-            f"showCopyToast('ID 已复制')")
-            if e.args.get("colId") == "review_id" else None)
+        def on_cell_click(e):
+            data = e.args["data"]
+            if e.args.get("colId") == "review_id":
+                # 点 ID 格 = 复制完整 ID(显示截断不影响),不开抽屉
+                ui.run_javascript(
+                    f"copyText({json.dumps(data['review_id'])});"
+                    f"showCopyToast('ID 已复制')")
+                return
+            # 其余任意格 → 右侧抽屉:链接档案 + 按日期的跟踪历史
+            fill_review_drawer(rev_body, rev_drawer, data["review_id"],
+                               on_refresh=load_rows)
+            rev_drawer.show()
+
+        grid.on("cellClicked", on_cell_click)
 
         def load_rows():
             # 换时间范围时重置切卡筛选,重新统计卡片数量;搜索词保留继续生效
@@ -1557,6 +1861,45 @@ def schedule_dialog():
              f'<br>仅采集真实链接(演示数据自动跳过),按站点并行无头浏览器。</div>')
 
         ui.separator()
+        # 评价链接每日跟踪:全部链接分散在 24 小时内轮流检测(防风控)
+        html('<div class="card-title" style="font-size:14px">评价链接每日跟踪</div>')
+        rt_enabled = ui.switch(
+            "开启评价链接每日跟踪",
+            value=sget(MONITOR_DB, "review_track_enabled", "1") == "1")
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("每轮最多检测(条)").classes("pg-meta")
+            rt_batch = ui.number(
+                value=float(sget(MONITOR_DB, "review_track_batch", "3") or 3),
+                min=1, max=20, step=1, format="%.0f") \
+                .props("outlined dense").classes("w-28")
+            ui.label(f"当前跟踪 {len(review_db.list_tracked())} 条 · "
+                     f"已停止 {len(review_db.list_stopped())} 条").classes("pg-meta")
+        rt_last = sget(MONITOR_DB, "review_track_last_run", "")
+        rt_stat = sget(MONITOR_DB, "review_track_last_stat", "")
+        html(f'<div class="pg-meta">上次:{rt_last or "未跑过"}'
+             f'{(" · " + rt_stat) if rt_stat else ""}<br>'
+             f'每天一次,全部链接按哈希均匀铺到 24 小时里轮流检测(彼此错开,'
+             f'避免同一时刻集中请求);每轮小批量;连续 5 次判定为已删(变狗)'
+             f'的链接自动停止跟踪。</div>')
+
+        async def _run_reviews():
+            d.close()
+            ui.notify("评价链接跟踪进行中,完成后自动刷新…", type="info")
+            try:
+                r = await run.io_bound(review_track.run_once, MONITOR_DB,
+                                       MONITOR_DB, None, True)
+                if r.get("checked"):
+                    msg = (f"跟踪完成:检查 {r['checked']} 条"
+                           + (f",停止跟踪 {len(r['stopped'])} 条"
+                              if r.get("stopped") else ""))
+                else:
+                    msg = r.get("note", "本轮没有需要检测的链接")
+                ui.notify(msg, type="positive")
+                ui.navigate.reload()
+            except Exception as e:
+                ui.notify(f"跟踪失败:{e.__class__.__name__}: {e}", type="negative")
+
+        ui.separator()
         # 钉钉通知:群机器人 webhook(简单) / 企业内部应用机器人单聊(私聊)
         html('<div class="card-title" style="font-size:14px">钉钉通知</div>')
         mode_sel = ui.radio({"group": "群机器人 Webhook", "app": "企业内部应用"},
@@ -1636,6 +1979,9 @@ def schedule_dialog():
         def _save():
             sset(MONITOR_DB, "schedule_enabled", "1" if enabled.value else "0")
             sset(MONITOR_DB, "schedule_interval_h", str(interval.value or 6))
+            sset(MONITOR_DB, "review_track_enabled",
+                 "1" if rt_enabled.value else "0")
+            sset(MONITOR_DB, "review_track_batch", str(int(rt_batch.value or 3)))
             sset(MONITOR_DB, "notify_mode", mode_sel.value or "group")
             sset(MONITOR_DB, "notify_webhook", (wh.value or "").strip())
             sset(MONITOR_DB, "notify_secret", (sec.value or "").strip())
@@ -1684,6 +2030,8 @@ def schedule_dialog():
         with ui.row().classes("w-full justify-end gap-2 mt-1"):
             ui.button("测试推送", on_click=_test).props("outline no-caps dense")
             ui.button("立即采集一轮", on_click=_run_now) \
+                .props("outline no-caps dense")
+            ui.button("立即跟踪一轮", on_click=_run_reviews) \
                 .props("outline no-caps dense")
             ui.button("保存", on_click=_save) \
                 .props("unelevated no-caps dense color=primary")
@@ -1841,6 +2189,34 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
 # ---------- 弹窗:登录 / IP 热度 / 系统维护 ----------
 
 
+# 登录会话的专属工作线程。
+# Playwright 同步 API 有两条硬约束:①不能在 asyncio 事件循环里调用(会直接抛
+# "It looks like you are using Playwright Sync API inside the asyncio loop");
+# ②同一个会话必须在同一个线程里用,换线程会 "Cannot switch to a different thread"。
+# 因此按域名各配一个单线程池:同域名串行且固定线程,不同域名互不阻塞。
+_LOGIN_POOLS: dict[str, ThreadPoolExecutor] = {}
+
+
+async def _login_bound(dom: str, fn, *args):
+    """把同步的 Playwright 操作丢进该域名专属线程执行,不阻塞 UI 事件循环。"""
+    pool = _LOGIN_POOLS.get(dom)
+    if pool is None:
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"login-{dom}")
+        _LOGIN_POOLS[dom] = pool
+    return await asyncio.get_running_loop().run_in_executor(pool, fn, *args)
+
+
+def _open_session(dom: str, tries: int = 3):
+    """关掉旧会话后立刻重建;Chromium 退出有延迟,档案锁偶发没释放,重试几次。"""
+    for i in range(tries):
+        try:
+            return weblogin.get_session(dom)
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(1.5)
+
+
 def login_dialog():
     status = login_status()
     acct_keys = {k for k in ACCOUNTS if not k.startswith("_")}
@@ -1862,34 +2238,70 @@ def login_dialog():
         msg = ui.label("").classes("pg-meta")
         img_holder = ui.column().classes("w-full")
 
-        def _do(kind):
+        HINT = {
+            "login": "正在启动服务器浏览器并自动登录,约 10~40 秒,请勿关闭弹窗…",
+            "code": "正在提交验证码…",
+            "check": "正在检查登录态…",
+        }
+        running = {"on": False}
+
+        async def _do(kind):
+            """按钮回调:同步 Playwright 调用必须丢进专属线程,否则会卡死整个事件循环。"""
+            if running["on"]:
+                return
+            running["on"] = True
             dom = sel.value
-            sess = weblogin.get_session(dom)
-            try:
+            acct, pwd = account.value or "", password.value or ""
+            secret, manual = (totp.value or "").strip(), code.value or ""
+            btns = {"login": b_login, "code": b_code, "check": b_check}
+            for b in btns.values():
+                b.props("disable")
+            btns[kind].props("loading")
+            t0 = time.time()
+            msg.set_text(HINT[kind])
+
+            def _tick():
+                msg.set_text(f"{HINT[kind]}(已等待 {int(time.time() - t0)} 秒)")
+
+            ticker = ui.timer(1.0, _tick)
+
+            def _work():
+                # 这里跑在该域名的专属线程里,可以安全调用同步 Playwright
                 if kind == "login":
-                    weblogin.close_domains({dom})
-                    m, img = sess.auto_login(account.value, password.value, totp.value.strip())
-                elif kind == "code":
+                    weblogin.close_domains({dom})  # 先释放档案,免得和检测引擎抢 profile 锁
+                    return _open_session(dom).auto_login(acct, pwd, secret)
+                sess = _open_session(dom)
+                if kind == "code":
                     k = "otp" if sess.page.query_selector(
                         "#auth-mfa-otpcode, input[name='otpCode']") is not None else "captcha"
-                    m, img = sess.submit_code(k, code.value)
-                else:  # check
-                    ok = sess.logged_in()
-                    m, img = (f"✅ {dom} 登录态已保存", None) if ok else ("未登录", sess.shot())
+                    return sess.submit_code(k, manual)
+                ok = sess.logged_in()
+                return (f"✅ {dom} 登录态已保存", None) if ok else ("未登录", sess.shot())
+
+            try:
+                m, img = await _login_bound(dom, _work)
                 msg.set_text(m)
                 img_holder.clear()
                 if img:
                     with img_holder:
                         ui.image(img).classes("w-full rounded-md")
+                if kind == "check":
+                    ui.notify(m, type="positive" if m.startswith("✅") else "warning")
             except Exception as e:
                 msg.set_text(f"出错:{e.__class__.__name__}: {e}")
+                ui.notify(f"登录操作失败:{e}", type="negative")
+            finally:
+                ticker.cancel()
+                for b in btns.values():
+                    b.props(remove="disable loading")
+                running["on"] = False
 
         with ui.row().classes("w-full gap-2"):
-            ui.button("开始登录", on_click=lambda: _do("login")) \
+            b_login = ui.button("开始登录", on_click=lambda: _do("login")) \
                 .props("unelevated no-caps color=primary").classes("flex-grow")
-            ui.button("提交验证码", on_click=lambda: _do("code")) \
+            b_code = ui.button("提交验证码", on_click=lambda: _do("code")) \
                 .props("outline no-caps").classes("flex-grow")
-        ui.button("检测登录态", on_click=lambda: _do("check")) \
+        b_check = ui.button("检测登录态", on_click=lambda: _do("check")) \
             .props("outline no-caps").classes("w-full")
     d.open()
 
@@ -2021,6 +2433,18 @@ def build_shell(nav: str):
             sidebar_nav()
         with ui.column().classes("main-area flex-grow items-stretch"):
             yield
+
+
+def _report_exception(e: Exception) -> None:
+    """兜底:没被 catch 的界面异常也弹出来,避免用户只看到"点了没反应"。"""
+    try:
+        ui.notify(f"服务端异常:{e.__class__.__name__}: {e}", type="negative",
+                  multi_line=True)
+    except Exception:
+        pass
+
+
+app.on_exception(_report_exception)
 
 
 ui.run(title="AmReview 评价检测", port=8765, reload=False, show=False,
