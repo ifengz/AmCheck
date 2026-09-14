@@ -790,7 +790,43 @@ def detail_dialog(r: dict):
                           f"window.open({json.dumps(u)}, '_blank')")) \
                 .props("outline no-caps dense icon=open_in_new")
             if len(review_history_timeline(r["review_id"])) > 1:
-                ui.button("历史轨迹").props("outline no-caps dense")
+                ui.button("历史轨迹", on_click=lambda rid=r["review_id"]:
+                          timeline_dialog(rid)) \
+                    .props("outline no-caps dense")
+    d.open()
+
+
+def timeline_dialog(review_id: str):
+    """详情弹窗「历史轨迹」→ 该评价链接的逐次检测记录。
+
+    与抽屉里的跟踪历史同源同列,但独立成弹窗:检测页没有抽屉,
+    点一次弹一次,关掉回到详情,不互相干扰。
+    """
+    timeline = review_history_timeline(review_id)
+    with ui.dialog() as d, ui.card().classes("app-card w-[720px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html(f'<div class="card-title">历史轨迹 · {review_id}</div>'
+                 f'<div class="pg-meta">共 {len(timeline)} 次检测(最新在前)</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+        rows = [{
+            "checked": t["checked_at"],
+            "status_text": status_text(t["status"]),
+            "stars": stars_html(t["stars"]),
+            "title": t["title"] or "—",
+            "note": t["note"] or "—",
+        } for t in timeline]
+        ui.aggrid({
+            "columnDefs": [
+                {"headerName": "检测时间", "field": "checked", "width": 158},
+                {"headerName": "状态", "field": "status_text", "width": 78},
+                {"headerName": "星级", "field": "stars", "width": 64},
+                {"headerName": "标题", "field": "title", "minWidth": 140, "flex": 2},
+                {"headerName": "判定依据", "field": "note", "minWidth": 140, "flex": 2},
+            ],
+            "rowData": rows,
+            "defaultColDef": {"sortable": True, "resizable": True},
+            "rowHeight": 28,
+        }, html_columns=[1, 2]).classes("w-full ag-dense")
     d.open()
 
 
