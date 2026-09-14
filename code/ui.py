@@ -404,11 +404,23 @@ monitor_store.init_db(MONITOR_DB)   # 监控库补列迁移(bsr_cat/bsr_sub 等)
 # 应用内定时采集:后台守护线程,间隔/开关存 settings 表,UI 改完即生效
 from monitor.scheduler import Scheduler as _MonitorScheduler
 monitor_scheduler = _MonitorScheduler(MONITOR_DB)
-monitor_scheduler.start()
 
 # 评价链接每日跟踪:同样是后台守护线程,把全部链接分散到 24 小时里各查一次
 review_tracker = review_track.ReviewTracker(DB, MONITOR_DB)
-review_tracker.start()
+
+
+async def _start_background_jobs():
+    """服务真正起来时才拉起后台线程。
+
+    **不能在模块导入期启动**:测试(test_login_thread 等)会 exec 本文件
+    (截到 ui.run 之前),导入期起线程会让「跑一次单测」顺手触发真实的
+    Amazon 采集与评价链接检测。
+    """
+    monitor_scheduler.start()
+    review_tracker.start()
+
+
+app.on_startup(_start_background_jobs)
 
 # ---------- 设计系统:可复用的小组件 ----------
 
