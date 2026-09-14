@@ -1,15 +1,12 @@
 """「添加监控链接」的可见反馈回归测试。
 
 现象:粘贴 6 条商品链接、点「添加」,界面没有任何变化,像没点过一样。
-两个成因叠在一起,缺一个都还会复发:
-
-1. ``_add()`` 成功入库后立刻调 ``on_done()`` → ``ui.navigate.to("/monitor")``,
-   整页跳转当场销毁刚发出的 toast → 成功提示根本来不及看;
-2. 监控页空态只看快照数(``count_snapshots``),而添加监控只写 ``profiles``、
-   不产生快照 → 跳转回来照旧是「还没有监控数据」,连刚加的链接都看不到。
+现在的契约:入库 → 提示 → 立即把刚加这批交给采集回调(「入库即采集」,
+不再「入库即返回」干等手动跑一轮)。失败时不关窗、错误写在弹窗里。
 
 这里把 ``add_monitor_dialog()`` 真建在裸 Client 里,走线上真实链路点一次
-「添加」,断言:链接真入库、提示真发出、没有立刻跳页、失败时不关窗。
+「添加」,断言:链接真入库、提示真发出、采集回调拿到刚加的那批、
+失败时不关窗也不开采。
 
 不启服务、不启浏览器、不碰真 monitor.db(全程用临时库)。
 """
@@ -93,7 +90,8 @@ class AddMonitorDialogTests(unittest.TestCase):
 
         ms.init_db(self.db)
 
-        self.notified, self.timers, self.navigated, self.done = [], [], [], []
+        self.notified, self.timers, self.navigated, self.collected = \
+            [], [], [], []
 
         ui = self.ns["ui"]
         original = (ui.notify, ui.timer, ui.navigate.to)
@@ -104,7 +102,6 @@ class AddMonitorDialogTests(unittest.TestCase):
         self.addCleanup(restore)
 
         ui.notify = lambda msg, **kw: self.notified.append((msg, kw.get("type")))
-        # 真定时器要等 1.5s,这里只记下参数,由用例决定什么时候触发回调
         ui.timer = lambda delay, cb, **kw: self.timers.append((delay, cb, kw))
         ui.navigate.to = lambda target, new_tab=False: self.navigated.append(target)
 
@@ -112,7 +109,9 @@ class AddMonitorDialogTests(unittest.TestCase):
 
     def _open_dialog(self):
         with self.client:
-            self.ns["add_monitor_dialog"](lambda: self.done.append(True))
+            # on_collect 收到的就是「添加监控」移交过来的刚入库那批 profiles
+            self.ns["add_monitor_dialog"](
+                lambda added: self.collected.append(added))
 
     def _textarea(self):
         from nicegui.elements.textarea import Textarea
@@ -175,23 +174,37 @@ class AddMonitorDialogTests(unittest.TestCase):
 
         rows = ms.list_profiles(self.db, only_enabled=False)
         self.assertEqual({(r["asin"], r["domain"]) for r in rows}, EXPECTED)
-        self.assertEqual(self.notified, [("已添加 6 条监控", "positive")])
+        self.assertEqual(len(self.notified), 1)
+        msg, typ = self.notified[0]
+        self.assertEqual(typ, "positive")
+        self.assertIn("已添加 6 条监控", msg)
+        self.assertIn("立即开始采集", msg)
 
-    def test_refresh_is_deferred_so_the_success_toast_survives(self):
-        """回归:立刻 on_done() 是整页跳转,会把刚发出的 toast 一起冲掉。"""
+    def test_storage_immediately_hands_new_links_to_collection(self):
+        """「入库即采集」:刚加的这批必须立刻交给采集回调(不再干等手动跑)。
+
+        回调拿到的是 profiles 里的完整行(含 metric_config 等采集要用的字段),
+        且只含本次新加的,不含库里原有的其它监控。
+        """
+        self._profile_first("B0OLDOLDOL")   # 库里原有一条,不属于这批
+
         self._open_dialog()
         self._textarea().value = LINKS
         self._click("添加")
 
-        self.assertTrue(self.notified, "得先给用户一条成功提示")
-        self.assertEqual(self.done, [], "不能立刻跳页,否则提示还没看见就被冲掉")
-        self.assertEqual([t[0] for t in self.timers],
-                         [self.ns["ADD_MONITOR_REFRESH_DELAY"]])
+        self.assertEqual(len(self.collected), 1, "恰好一次采集,不多不少")
+        batch = self.collected[0]
+        self.assertEqual({(p["asin"], p["domain"]) for p in batch}, EXPECTED)
+        self.assertTrue(all("metric_config" in p for p in batch),
+                        "得是回读的完整 profile 行,采集要读 metric_config")
+        self.assertNotIn("B0OLDOLDOL", {p["asin"] for p in batch},
+                         "只抓刚加这批,别把旧链接也捎上")
 
-        _, callback, kwargs = self.timers[0]
-        self.assertTrue(kwargs.get("once"), "一次性定时器,别反复刷页")
-        callback()
-        self.assertEqual(self.done, [True], "延时到了还是得刷新,否则页面停在旧状态")
+    def _profile_first(self, asin):
+        from monitor import store as ms
+        ms.upsert_profile(self.db, {
+            "asin": asin, "domain": "amazon.com",
+            "url": f"https://amazon.com/dp/{asin}", "monitor_enabled": 1})
 
     def test_already_tracked_links_are_skipped_and_said_so(self):
         """重复添加不该报错,但要明说跳过了几条 —— 否则看着也像没反应。"""
@@ -199,7 +212,7 @@ class AddMonitorDialogTests(unittest.TestCase):
         self._textarea().value = LINKS
         self._click("添加")
         self.notified.clear()
-        self.done.clear()
+        self.collected.clear()
 
         self._textarea().value = LINKS
         self._click("添加")
@@ -208,6 +221,7 @@ class AddMonitorDialogTests(unittest.TestCase):
 
         self.assertEqual(len(ms.list_profiles(self.db, only_enabled=False)), 6)
         self.assertEqual(self.notified, [("跳过已存在 6 条", "warning")])
+        self.assertEqual(self.collected, [], "全是跳过,就不该开浏览器")
 
     def test_unparsable_input_keeps_the_dialog_open_with_a_hint(self):
         self._open_dialog()
@@ -216,7 +230,7 @@ class AddMonitorDialogTests(unittest.TestCase):
 
         self.assertEqual(self.notified, [])
         self.assertIn("未解析到有效商品链接", self._label_texts())
-        self.assertEqual(self.done, [], "没入库就不该刷新页面")
+        self.assertEqual(self.collected, [], "没入库就不该采集")
 
     def test_storage_failure_is_shown_instead_of_silently_swallowed(self):
         """回归:入库炸了也要在弹窗里说一声,不能只落在服务端日志里。
@@ -241,7 +255,7 @@ class AddMonitorDialogTests(unittest.TestCase):
         self.assertIn("添加失败", self._label_texts())
         self.assertIn("OperationalError", self._label_texts())
         self.assertEqual(self.notified, [], "一条都没进去就别报成功")
-        self.assertEqual(self.done, [], "失败了得让用户看着错误,不能刷掉")
+        self.assertEqual(self.collected, [], "失败了就别开浏览器")
 
     def test_fresh_db_without_tables_still_accepts_links(self):
         """回归:get_profile 不建表,全新库第一次添加会 no such table: profiles。"""
@@ -252,7 +266,9 @@ class AddMonitorDialogTests(unittest.TestCase):
         self._textarea().value = LINKS
         self._click("添加")
 
-        self.assertEqual(self.notified, [("已添加 6 条监控", "positive")])
+        self.assertEqual(len(self.notified), 1)
+        self.assertIn("已添加 6 条监控", self.notified[0][0])
+        self.assertEqual(self.notified[0][1], "positive")
 
 
 class UntrackedProfileTests(unittest.TestCase):

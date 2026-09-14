@@ -1667,7 +1667,7 @@ def page_monitor():
         _repaint = {"fn": refresh}
 
         def soft_refresh():
-            """只重读库、重画明细区(表格 + 已添加未采集),不做整页跳转。
+            """只重读库、重画明细区(表格 + 摘要计数),不做整页跳转。
 
             页面骨架(页头/按钮/搜索框/抽屉)原地保留,滚动位置不丢;
             仅当快照有无被别的进程翻转(如后台定时采集刚出第一批数据)时,
@@ -1681,31 +1681,35 @@ def page_monitor():
             _repaint["fn"]()
 
         # 国家切卡 + 操作按钮同一行:左侧国家卡,右侧按钮(右缘与搜索框对齐)
+        # 定时/钉钉/AI 是全局设置,入口在侧边栏「系统维护」下方,不放页面按钮
         # st = 状态筛选:None 不限 / "abnormal" 只看异常 / "normal" 只看正常
         cur = {"cc": "全部", "st": None}
+
+        def start_collect(profiles=None):
+            """跑一轮采集。「添加监控」传刚入库那批(入库即抓),按钮不传=全部启用。
+            完成后走 soft_refresh:原地重画明细,不整页跳转、不丢滚动位置。"""
+            return run_monitor_round(soft_refresh, btn_run, prog, prog_text,
+                                     prog_row, profiles=profiles)
+
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
             card_holder = ui.row().classes("items-center gap-2 flex-grow")
             with ui.row().classes("items-center gap-2 flex-none"):
                 ui.button("刷新", icon="refresh", on_click=soft_refresh) \
                     .props("outline no-caps dense").classes("w-[116px]")
                 btn_run = ui.button(
-                    "跑一轮采集",
-                    on_click=lambda: run_monitor_round(
-                        refresh, btn_run, prog, prog_text, prog_row)) \
+                    "跑一轮采集", on_click=lambda: start_collect()) \
                     .props("outline no-caps dense").classes("w-[116px]")
                 ui.button("添加监控", icon="add_link",
-                          on_click=lambda: add_monitor_dialog(refresh)) \
+                          on_click=lambda: add_monitor_dialog(start_collect)) \
                     .props("unelevated no-caps dense color=primary") \
                     .classes("w-[116px]")
-                ui.button("定时与通知", icon="schedule",
-                          on_click=schedule_dialog) \
-                    .props("outline no-caps dense").classes("w-[116px]")
 
         def _pending_card(pend, note=None):
-            """把「已添加未采集」的链接列成卡片(空态与有数据页共用)。
+            """把「已添加未采集」的链接列成卡片(只在空态用)。
 
-            这批链接没有快照、进不了看板表格 —— 不列出来的话,在已有数据的
-            页面上添加新链接就完全找不到,表现就是「加完不知道在哪」。
+            这批链接没有快照、进不了看板表格,空态时列出来,添加动作才有回执。
+            有数据的页面不再列它(会把明细卡挤出屏幕,破坏拉伸到底的版式),
+            未采集数改在摘要行报个数;新链接入库即采集(见 add_monitor_dialog)。
             """
             if note:
                 html(note)
@@ -1726,8 +1730,10 @@ def page_monitor():
                              + ('' if p.get("monitor_enabled", 1) else
                                 '<span class="pg-meta">已停用</span>'))
 
-        # 正文区容器:空态与看板都画在这里,「刷新」原地重画,不整页跳转
-        body_holder = ui.column().classes("w-full")
+        # 正文区容器:空态与看板都画在这里,「刷新」原地重画,不整页跳转。
+        # flex-grow min-h-0 不能省:明细卡的 ag-fill 靠这条 flex 链撑到页面底部
+        # (46c069d 曾漏掉它,表格缩回行数高、下方空一片,已修)
+        body_holder = ui.column().classes("w-full flex-grow min-h-0")
 
         def render_empty():
             """空态(含「已添加未采集」中间态)整体重画进 body_holder。"""
@@ -1874,16 +1880,9 @@ def page_monitor():
                     continue
                 rows.append(row)
             rows.sort(key=lambda r: (r["_sev"], -r["_ts"]))
-            # 新加的链接还没有快照,不会出现在下面的表里 —— 直接在表格下方
-            # 列出来(同样按当前国家/搜索词过滤),否则在有数据的页面上
-            # 添加链接,用户根本找不到它在哪;
-            # 选了异常/正常时不列 —— 未采集的链接两边都不算,列出来反而和筛选打架
-            pend = [p for p in _pending()
-                    if cur["st"] is None
-                    and (cur["cc"] == "全部" or DOMAIN_SHORT(p["domain"]) == cur["cc"])
-                    and (not q.value
-                         or q.value.lower()
-                         in (p["asin"] + " " + (p.get("url") or "")).lower())]
+            # 新加的链接还没有快照,进不了表格 —— 只在摘要行报个数,
+            # 不再在表格下方列卡片区(那会把明细卡挤出屏幕,破坏拉伸版式)
+            pend = _pending()
             extra = f' · 另有 {len(pend)} 条已添加未采集' if pend else ''
             summary.set_content(
                 f'<div class="pg-meta">监控 {data_now["total"]} 条 · 异常 '
@@ -1893,11 +1892,6 @@ def page_monitor():
             grid_holder.clear()
             with grid_holder:
                 make_grid(rows)
-                if pend:
-                    html('<div class="pg-meta" style="margin:10px 0 6px">'
-                         '以下链接已添加,还没有采集数据 —— '
-                         '点上方「跑一轮采集」后才会进入表格:</div>')
-                    _pending_card(pend)
             text_holder.clear()   # 换筛选/重采后旧的文案区不再对应,清掉
 
         def make_grid(rows):
@@ -1950,14 +1944,18 @@ def page_monitor():
         rebuild()
 
 
+# ---------- 全局设置弹窗:定时 / 钉钉通知 / AI 解读 ----------
+# 三个设置彼此独立(开关一套 key、通知一套 key、AI 一套 key),各自一个入口,
+# 都从侧边栏「系统维护」下方进 —— 它们是全局性的,不挂在某一页的操作行里。
+# 配置存 settings 表,后台调度/采集线程实时读取生效。
+
+
 def schedule_dialog():
-    """定时采集 + 钉钉通知设置:配置存 settings 表,后台线程实时读取生效。"""
-    from monitor import notify as mn
+    """定时采集 + 评价链接每日跟踪设置。"""
     sget, sset = monitor_store.get_setting, monitor_store.set_setting
-    cfg = mn.get_config(MONITOR_DB)
     with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
         with ui.row().classes("w-full items-center justify-between"):
-            html('<div class="card-title">定时采集与通知</div>')
+            html('<div class="card-title">定时采集与跟踪</div>')
             ui.button(icon="close", on_click=d.close).props("flat round dense")
 
         # 定时采集
@@ -2014,9 +2012,50 @@ def schedule_dialog():
             except Exception as e:
                 ui.notify(f"跟踪失败:{e.__class__.__name__}: {e}", type="negative")
 
-        ui.separator()
-        # 钉钉通知:群机器人 webhook(简单) / 企业内部应用机器人单聊(私聊)
-        html('<div class="card-title" style="font-size:14px">钉钉通知</div>')
+        async def _run_now():
+            # 立即跑一轮(复用调度器逻辑:真实链接采集 + 通知推送)
+            from monitor.scheduler import run_once
+            d.close()
+            ui.notify("采集进行中,完成后自动刷新…", type="info")
+            try:
+                r = await run.io_bound(run_once, MONITOR_DB)
+                ui.notify(f"采集完成:检查 {r['checked']} 条,"
+                          f"异常 {r['anomalies']} 条",
+                          type="warning" if r["anomalies"] else "positive")
+                ui.navigate.reload()
+            except Exception as e:
+                ui.notify(f"采集失败:{e.__class__.__name__}: {e}",
+                          type="negative")
+
+        def _save():
+            sset(MONITOR_DB, "schedule_enabled", "1" if enabled.value else "0")
+            sset(MONITOR_DB, "schedule_interval_h", str(interval.value or 6))
+            sset(MONITOR_DB, "review_track_enabled",
+                 "1" if rt_enabled.value else "0")
+            sset(MONITOR_DB, "review_track_batch", str(int(rt_batch.value or 3)))
+            ui.notify("已保存,定时采集按新配置运行", type="positive")
+            d.close()
+
+        with ui.row().classes("w-full justify-end gap-2 mt-1"):
+            ui.button("立即采集一轮", on_click=_run_now) \
+                .props("outline no-caps dense")
+            ui.button("立即跟踪一轮", on_click=_run_reviews) \
+                .props("outline no-caps dense")
+            ui.button("保存", on_click=_save) \
+                .props("unelevated no-caps dense color=primary")
+    d.open()
+
+
+def notify_dialog():
+    """钉钉通知设置:群机器人 webhook(简单) / 企业内部应用机器人单聊(私聊)。"""
+    from monitor import notify as mn
+    sget, sset = monitor_store.get_setting, monitor_store.set_setting
+    cfg = mn.get_config(MONITOR_DB)
+    with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">钉钉通知</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+
         mode_sel = ui.radio({"group": "群机器人 Webhook", "app": "企业内部应用"},
                             value=sget(MONITOR_DB, "notify_mode", "group")) \
             .props("inline dense")
@@ -2064,9 +2103,39 @@ def schedule_dialog():
         html('<div class="pg-meta">有新增异常时推送;静默期内同一 ASIN 的'
              '同类变化只提醒一次,防刷屏。</div>')
 
-        ui.separator()
-        # AI 解读:推送里每个 ASIN 下加一句人话总结;不配 key 则整段跳过
-        html('<div class="card-title" style="font-size:14px">AI 解读(可选)</div>')
+        def _save():
+            sset(MONITOR_DB, "notify_mode", mode_sel.value or "group")
+            sset(MONITOR_DB, "notify_webhook", (wh.value or "").strip())
+            sset(MONITOR_DB, "notify_secret", (sec.value or "").strip())
+            sset(MONITOR_DB, "notify_client_id", (cid.value or "").strip())
+            sset(MONITOR_DB, "notify_client_secret", (csec.value or "").strip())
+            sset(MONITOR_DB, "notify_robot_code", (rcode.value or "").strip())
+            sset(MONITOR_DB, "notify_user_ids", (uids.value or "").strip())
+            sset(MONITOR_DB, "notify_mute_h", str(mute.value or 12))
+            ui.notify("已保存,通知按新配置推送", type="positive")
+            d.close()
+
+        async def _test():
+            ok, msg = await run.io_bound(
+                mn.push_text, MONITOR_DB,
+                "AmCheck 测试消息:通知配置 OK ✅")
+            ui.notify(msg, type="positive" if ok else "negative")
+
+        with ui.row().classes("w-full justify-end gap-2 mt-1"):
+            ui.button("测试推送", on_click=_test).props("outline no-caps dense")
+            ui.button("保存", on_click=_save) \
+                .props("unelevated no-caps dense color=primary")
+    d.open()
+
+
+def ai_dialog():
+    """AI 解读设置:推送里每个 ASIN 下加一句人话总结;不配 key 则整段跳过。"""
+    sget, sset = monitor_store.get_setting, monitor_store.set_setting
+    with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
+        with ui.row().classes("w-full items-center justify-between"):
+            html('<div class="card-title">AI 解读(可选)</div>')
+            ui.button(icon="close", on_click=d.close).props("flat round dense")
+
         from monitor import ai as _ai
         aicfg = _ai.get_ai_config(MONITOR_DB)
         akey = ui.input("API Key(留空则关闭 AI 解读)",
@@ -2092,19 +2161,6 @@ def schedule_dialog():
              '改完即生效,只影响推送「解读:」那一行,不影响告警触发。</div>')
 
         def _save():
-            sset(MONITOR_DB, "schedule_enabled", "1" if enabled.value else "0")
-            sset(MONITOR_DB, "schedule_interval_h", str(interval.value or 6))
-            sset(MONITOR_DB, "review_track_enabled",
-                 "1" if rt_enabled.value else "0")
-            sset(MONITOR_DB, "review_track_batch", str(int(rt_batch.value or 3)))
-            sset(MONITOR_DB, "notify_mode", mode_sel.value or "group")
-            sset(MONITOR_DB, "notify_webhook", (wh.value or "").strip())
-            sset(MONITOR_DB, "notify_secret", (sec.value or "").strip())
-            sset(MONITOR_DB, "notify_client_id", (cid.value or "").strip())
-            sset(MONITOR_DB, "notify_client_secret", (csec.value or "").strip())
-            sset(MONITOR_DB, "notify_robot_code", (rcode.value or "").strip())
-            sset(MONITOR_DB, "notify_user_ids", (uids.value or "").strip())
-            sset(MONITOR_DB, "notify_mute_h", str(mute.value or 12))
             sset(MONITOR_DB, "ai_api_key", (akey.value or "").strip())
             sset(MONITOR_DB, "ai_base_url", (abase.value or "").strip())
             sset(MONITOR_DB, "ai_model", (amodel.value or "").strip())
@@ -2118,48 +2174,23 @@ def schedule_dialog():
                 cc = cc.strip().upper()
                 if cc and txt.strip():
                     sset(MONITOR_DB, f"ai_prompt_{cc}", txt.strip())
-            ui.notify("已保存,定时采集按新配置运行", type="positive")
+            ui.notify("已保存,AI 解读按新配置生效", type="positive")
             d.close()
-
-        async def _test():
-            ok, msg = await run.io_bound(
-                mn.push_text, MONITOR_DB,
-                "AmCheck 测试消息:通知配置 OK ✅")
-            ui.notify(msg, type="positive" if ok else "negative")
-
-        async def _run_now():
-            # 立即跑一轮(复用调度器逻辑:真实链接采集 + 通知推送)
-            from monitor.scheduler import run_once
-            d.close()
-            ui.notify("采集进行中,完成后自动刷新…", type="info")
-            try:
-                r = await run.io_bound(run_once, MONITOR_DB)
-                ui.notify(f"采集完成:检查 {r['checked']} 条,"
-                          f"异常 {r['anomalies']} 条",
-                          type="warning" if r["anomalies"] else "positive")
-                ui.navigate.reload()
-            except Exception as e:
-                ui.notify(f"采集失败:{e.__class__.__name__}: {e}",
-                          type="negative")
 
         with ui.row().classes("w-full justify-end gap-2 mt-1"):
-            ui.button("测试推送", on_click=_test).props("outline no-caps dense")
-            ui.button("立即采集一轮", on_click=_run_now) \
-                .props("outline no-caps dense")
-            ui.button("立即跟踪一轮", on_click=_run_reviews) \
-                .props("outline no-caps dense")
             ui.button("保存", on_click=_save) \
                 .props("unelevated no-caps dense color=primary")
     d.open()
 
 
-# 添加监控成功后延后多久再刷新页面(秒)。刷新是 ui.navigate.to 整页跳转,
-# 会当场销毁刚发出的 toast —— 留一拍,「已添加 N 条监控」才看得见。
-ADD_MONITOR_REFRESH_DELAY = 1.5
+# 「添加监控」入库后立即开无头浏览器把新链接抓一遍(入库即采集)。
+# on_collect 由 page_monitor 传入(run_monitor_round 的包装,只抓刚加的这批);
+# 弹窗关掉、页上进度条开跑 —— 几条链接也要几十秒,采完自动进表格。
 
 
-def add_monitor_dialog(on_done):
-    """添加监控弹窗:粘贴 Amazon 商品页链接(或手填 ASIN),入库 profiles。"""
+def add_monitor_dialog(on_collect):
+    """添加监控弹窗:粘贴 Amazon 商品页链接(或手填 ASIN),入库 profiles,
+    成功后立刻交给 on_collect 真采一轮(不再「入库即返回」干等手动跑一轮)。"""
     with ui.dialog() as d, ui.card().classes("app-card w-[520px]"):
         with ui.row().classes("w-full items-center justify-between"):
             html('<div class="card-title">添加监控链接</div>')
@@ -2181,14 +2212,14 @@ def add_monitor_dialog(on_done):
             msg.style("color:#b91c1c")
 
         def _add():
-            """解析 → 入库 → 关窗 → 提示 → 刷新。
+            """解析 → 入库 → 关窗 → 提示 → 立刻开采。
 
-            用户报的「添加完没反应」有两条成因,都在这里堵住:
-            1. 入库只写 profiles、不产生快照,而监控页的空态判定只看快照数,
-               于是刷新后页面纹丝不动 → 刷新改成延迟一拍,配合页面侧的
-               「已添加未采集」中间态(见 page_monitor),让结果一定看得见;
-            2. 任何异常以前只落服务端日志,界面上什么都不显示 → 全程 try,
-               失败写进弹窗并且**不关窗**(关了就等于没发生)。
+            失败全程兜住,写进弹窗并且**不关窗**(关了就等于没发生) ——
+            「点了没反应」的老成因之一。
+
+            成功不再是「入库即返回」:把刚加的这批交给 on_collect 真开无头
+            浏览器抓一遍(几条链接也要几十秒)。弹窗立关,页上方进度条开跑,
+            提示语像导入评价那样明说「立即检测」 —— 用户看到进度条就知道没卡死。
             """
             try:
                 text = ta.value or ""
@@ -2213,7 +2244,7 @@ def add_monitor_dialog(on_done):
                 # get_profile 不负责建表,全新库(第一次添加)里直接查会
                 # "no such table: profiles" —— 先 init_db 兜底
                 ms.init_db(MONITOR_DB)
-                added = skipped = 0
+                added, skipped = [], 0
                 failed = []
                 for asin, domain, url in found:
                     try:
@@ -2221,7 +2252,11 @@ def add_monitor_dialog(on_done):
                             skipped += 1      # 已在监控中,不覆盖其配置
                             continue
                         add_profile(MONITOR_DB, asin=asin, domain=domain, url=url)
-                        added += 1
+                        # 回读完整行再交给采集:detect_snapshot 要读
+                        # metric_config 等字段,手拼的最小 dict 不如库里的行全
+                        row = ms.get_profile(MONITOR_DB, asin, domain)
+                        if row:
+                            added.append(row)
                     except Exception as e:    # 单条坏掉不拖垮整批
                         failed.append(f"{asin}@{DOMAIN_SHORT(domain)}"
                                       f"({e.__class__.__name__})")
@@ -2231,7 +2266,8 @@ def add_monitor_dialog(on_done):
                 d.close()
                 parts = []
                 if added:
-                    parts.append(f"已添加 {added} 条监控")
+                    parts.append(f"已添加 {len(added)} 条监控,立即开始采集"
+                                 "(进度看页面上方进度条,几条也要几十秒)")
                 if skipped:
                     parts.append(f"跳过已存在 {skipped} 条")
                 if errs:
@@ -2239,9 +2275,9 @@ def add_monitor_dialog(on_done):
                 if failed:
                     parts.append(f"{len(failed)} 条失败:" + "、".join(failed))
                 ui.notify(";".join(parts), type="positive" if added else "warning")
-                # 刷新走的是 ui.navigate.to(整页跳转),立刻执行会连刚发出的
-                # toast 一起冲掉 —— 延后一拍,让「已添加 N 条」真的看得见
-                ui.timer(ADD_MONITOR_REFRESH_DELAY, on_done, once=True)
+                # 只抓刚入库这批;一条都没加(全跳过/全失败)就别开浏览器了
+                if added and on_collect:
+                    return on_collect(added)
             except Exception as e:
                 log.exception("添加监控失败")
                 _fail(f"添加失败:{e.__class__.__name__}: {e}")
@@ -2252,8 +2288,11 @@ def add_monitor_dialog(on_done):
     d.open()
 
 
-def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
+def run_monitor_round(on_done, btn, prog, prog_text, prog_row, profiles=None):
     """跑一轮采集:真实抓取 profiles 里启用的 ASIN,按站点并行。
+
+    profiles=None 抓全部启用的监控链接;传入列表(「添加监控」刚入库的
+    那批)则只抓这些 —— 新链接入库即开无头浏览器抓一遍,不用用户再点。
 
     交互:按钮进入 loading → 页内进度条按站点粒度推进(显示各站点进行中)
     → 完成后进度条报告结果并自动刷新表格;全程不弹窗不跳页。
@@ -2268,8 +2307,8 @@ def run_monitor_round(on_done, btn, prog, prog_text, prog_row):
     from monitor.scheduler import demo_asins
 
     # 演示 ASIN 跳过真实抓取(会把种子时间线打成脏数据)
-    profs = [p for p in ms.list_profiles(MONITOR_DB)
-             if p["asin"] not in demo_asins()]
+    source = profiles if profiles is not None else ms.list_profiles(MONITOR_DB)
+    profs = [p for p in source if p["asin"] not in demo_asins()]
     if not profs:
         ui.notify("还没有监控链接,先点「添加监控」", type="warning")
         return
@@ -2653,6 +2692,13 @@ def sidebar_nav():
         ui.button("IP 热度", icon="speed", on_click=heat_dialog) \
             .props("flat no-caps align=left")
         ui.button("系统维护", icon="settings", on_click=system_dialog) \
+            .props("flat no-caps align=left")
+        # 全局设置(定时/通知/AI)都归在系统维护下方,不占页面操作行
+        ui.button("定时与通知", icon="schedule", on_click=schedule_dialog) \
+            .props("flat no-caps align=left")
+        ui.button("钉钉通知", icon="notifications", on_click=notify_dialog) \
+            .props("flat no-caps align=left")
+        ui.button("AI 解读", icon="auto_awesome", on_click=ai_dialog) \
             .props("flat no-caps align=left")
         if online < len(status):
             html(f'<div class="pg-meta" style="padding:0 12px">'

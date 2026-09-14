@@ -152,6 +152,17 @@ class MonitorRefreshButtonTests(unittest.TestCase):
     def test_refresh_button_exists_in_action_row(self):
         self._render()
         self._button("刷新")   # 找不到会 fail
+        self._button("跑一轮采集")
+        self._button("添加监控")
+
+    def test_settings_buttons_moved_off_action_row(self):
+        """「定时与通知」等全局设置已移到侧边栏,页面操作行只剩三个按钮。"""
+        from nicegui.elements.button import Button
+        self._render()
+        texts = {el.text for el in self.client.elements.values()
+                 if isinstance(el, Button) and el.text}
+        self.assertNotIn("定时与通知", texts,
+                         "设置入口在侧边栏「系统维护」下方,不在页面上")
 
     def test_click_does_not_navigate_the_whole_page(self):
         self._profile("B0AAAAAAAA")
@@ -161,32 +172,55 @@ class MonitorRefreshButtonTests(unittest.TestCase):
         self.assertEqual(self.navigated, [],
                          "刷新只该重画明细,不该 ui.navigate.to 整页跳转")
 
-    def test_new_pending_link_shows_up_after_refresh(self):
-        """核心场景:已有看板数据的页面上加了新链接,点刷新就能看见它。"""
+    def test_new_pending_link_counted_in_summary_after_refresh(self):
+        """核心场景:已有看板数据的页面加了新链接,刷新后摘要行报出「未采集」数。
+
+        表格下方不再列「已添加未采集」卡片区(那会破坏明细卡拉伸到底的版式);
+        新链接的入库回执由「添加即采集」的进度条承担。
+        """
         self._profile("B0AAAAAAAA")
         self._snapshot("B0AAAAAAAA")
         self._render()
-        self.assertNotIn("B0BBBBBBBB", self._page_text())
+        self.assertNotIn("另有 1 条已添加未采集", self._page_text())
 
         self._profile("B0BBBBBBBB")
         self._click_refresh()
-        self.assertIn("B0BBBBBBBB", self._page_text(),
-                      "刷新后「已添加未采集」列表里应出现新链接")
+        self.assertIn("另有 1 条已添加未采集", self._page_text(),
+                      "刷新后摘要行应报出新加的未采集链接数")
         self.assertEqual(self.navigated, [])
 
-    def test_pending_card_disappears_after_it_gets_a_snapshot(self):
-        """跑完采集(有了快照)再刷新,新链接从中间态挪进表格区,不重复列。"""
+    def test_no_pending_card_area_below_table(self):
+        """有数据页:表格下方不得再挂「已添加未采集」卡片区(回归拉伸版式)。"""
         self._profile("B0AAAAAAAA")
         self._snapshot("B0AAAAAAAA")
-        self._profile("B0BBBBBBBB")
+        self._profile("B0BBBBBBBB")          # 一条未采集
         self._render()
-        self.assertIn("B0BBBBBBBB", self._page_text())
-        self.assertIn("已添加,还没有采集数据", self._page_text())
+        text = self._page_text()
+        self.assertNotIn("以下链接已添加", text,
+                         "表下卡片区已移除,不能再回来")
+        self.assertNotIn("点上方「跑一轮采集」后才会进入表格", text)
 
-        self._snapshot("B0BBBBBBBB")
-        self._click_refresh()
-        self.assertNotIn("已添加,还没有采集数据", self._page_text(),
-                         "有了快照就不该再挂在「未采集」列表里")
+    def test_detail_card_stretches_to_bottom(self):
+        """明细卡拉伸链:agGrid 到 body_holder 的祖先列都带 flex-grow。
+
+        46c069d 曾把 grid 包进无 flex-grow 的 body_holder,拉伸链断掉、
+        明细卡缩回行数高;这条守住「恢复原来的拉伸到底」。
+        """
+        self._profile("B0AAAAAAAA")
+        self._snapshot("B0AAAAAAAA")
+        self._render()
+        from nicegui.elements.aggrid import AgGrid
+        grid = next(el for el in self.client.elements.values()
+                    if isinstance(el, AgGrid))
+        chain = []
+        slot = grid.parent_slot
+        while slot is not None:
+            chain.append(slot.parent)
+            slot = slot.parent.parent_slot
+        # grid_holder 与 body_holder 两级都得是 flex-grow,ag-fill 才撑得起来
+        growers = [e for e in chain if "flex-grow" in e._classes]
+        self.assertGreaterEqual(len(growers), 2,
+                                "明细卡到正文容器之间的 flex-grow 链断了")
 
     def test_empty_state_page_refreshes_in_place(self):
         """空态(只有 profiles 没快照):刷新同样原地重画,新链接看得见。"""
