@@ -964,12 +964,12 @@ def fill_review_drawer(body, drawer, review_id, on_refresh=None):
 
         with ui.row().classes("items-center gap-2"):
             if url:
-                ui.button("打开原页面", on_click=lambda u=url: ui.open(u, new_tab=True)) \
+                ui.button("打开评价页面", on_click=lambda u=url: ui.open(u, new_tab=True)) \
                     .props("outline no-caps dense icon=open_in_new")
-                ui.button("复制链接",
+                ui.button("复制评价链接",
                           on_click=lambda u=url: (
                               ui.run_javascript(
-                                  f"copyText({json.dumps(u)});showCopyToast('链接已复制')"))) \
+                                  f"copyText({json.dumps(u)});showCopyToast('评价链接已复制')"))) \
                     .props("outline no-caps dense icon=content_copy")
             check_btn = ui.button("立即检测一次", icon="play_arrow") \
                 .props("unelevated no-caps dense color=primary")
@@ -1046,7 +1046,7 @@ def fill_review_drawer(body, drawer, review_id, on_refresh=None):
             "rowData": rows,
             "defaultColDef": {"sortable": True, "resizable": True},
             "rowHeight": 28,
-        }, html_columns=[1, 2]).classes("w-full ag-dense").style("height:320px")
+        }, html_columns=[1, 2]).classes("w-full ag-dense ag-drawer-fill")
 
 
 # ---------- 页面:历史 ----------
@@ -1058,7 +1058,8 @@ def page_history():
     # 与按日期的跟踪历史。q-drawer 属顶层布局元素,必须建在页面函数体里。
     with ui.drawer("right", value=False, bordered=True) as rev_drawer:
         rev_drawer.props("width=880 breakpoint=9999")
-        rev_body = ui.column().classes("w-full gap-2 p-4")
+        # h-full + min-height:0 → 抽屉内容撑满整高,内部「跟踪历史」表格靠 flex 拉伸到底部
+        rev_body = ui.column().classes("w-full gap-2 p-4 h-full").style("min-height:0")
 
     with build_shell("/history"):
         days = {"kw": 7}
@@ -1076,9 +1077,11 @@ def page_history():
             with ui.column().classes("gap-0"):
                 html('<div class="pg-title">评价链接检测历史</div>')
                 meta = html('')
-            q = ui.input(placeholder="搜索 ID / 标题 / 作者 / 备注 …") \
+            # 搜索索引见 h_row 的 _hay:Review ID / 刷单编号 / 订单号 / 产品型号
+            # (标题/作者/备注/链接也一并命中,只是提示词只放常用的四个)
+            q = ui.input(placeholder="搜索 Review ID / 刷单编号 / 订单号 / 产品型号 …") \
                 .props("outlined dense hide-bottom-space") \
-                .classes("w-64").style("font-size:13px")
+                .classes("w-80").style("font-size:13px")
 
         # 切卡 + 时间范围/统计按钮同一行:左切卡,右按钮(与监控页国家卡+按钮同版式)
         with ui.row().classes("w-full items-center justify-between gap-3 mb-2 no-wrap"):
@@ -1197,30 +1200,41 @@ def page_history():
             build_cards()
             set_meta(len(shown))
 
+        # 列序:左固定(检测时间/Review ID/刷单编号/订单号) → 可滚动主区 →
+        # 右固定(国家/跟踪)。agGrid 要求固定列在 columnDefs 里连续且分居两端,
+        # 所以业务字段必须紧跟 Review ID、国家/跟踪必须排到最后。
+        # auto_size_columns=False 是关键:nicegui 默认会调 sizeColumnsToFit(),
+        # 把非固定列按剩余宽度硬压(实测被压到 36px、表头全是省略号),
+        # 关掉后各列保持声明宽度、放不下就横向滚动,固定列始终完整可见。
         grid = ui.aggrid({
             "columnDefs": [
                 {"headerName": "检测时间", "field": "checked", "width": 168,
                  "pinned": "left", "suppressSizeToFit": True},
-                {"headerName": "Review ID", "field": "review_id", "width": 148,
+                {"headerName": "Review ID", "field": "review_id", "width": 136,
                  "pinned": "left", "tooltipField": "review_id",
-                 "cellClass": "rid-copy"},
-                {"headerName": "刷单编号", "field": "order_ref", "width": 92},
-                {"headerName": "订单号", "field": "order_no", "width": 170},
+                 "cellClass": "rid-copy", "suppressSizeToFit": True},
+                {"headerName": "刷单编号", "field": "order_ref", "width": 90,
+                 "pinned": "left", "suppressSizeToFit": True},
+                {"headerName": "订单号", "field": "order_no", "width": 186,
+                 "pinned": "left", "suppressSizeToFit": True},
                 {"headerName": "产品型号", "field": "model", "width": 180},
                 {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
-                {"headerName": "站点", "field": "domain", "width": 62},
                 {"headerName": "状态", "field": "status_text", "width": 84},
-                {"headerName": "跟踪", "field": "track", "width": 76},
                 {"headerName": "星级", "field": "stars", "width": 66},
                 {"headerName": "标题", "field": "title", "minWidth": 160, "flex": 3},
                 {"headerName": "作者", "field": "author", "width": 90},
                 {"headerName": "评价日期", "field": "review_date", "width": 130},
                 {"headerName": "判定依据", "field": "note", "minWidth": 160, "flex": 2},
+                {"headerName": "国家", "field": "domain", "width": 70,
+                 "pinned": "right", "suppressSizeToFit": True},
+                {"headerName": "跟踪", "field": "track", "width": 80,
+                 "pinned": "right", "suppressSizeToFit": True},
             ],
             "rowData": [],
             "defaultColDef": {"sortable": True, "resizable": True},
             "rowHeight": 30,
-        }, html_columns=[5, 7, 9]).classes("w-full ag-dense ag-fill")
+        }, html_columns=[5, 6, 7], auto_size_columns=False) \
+            .classes("w-full ag-dense ag-fill")
 
         def on_cell_click(e):
             data = e.args["data"]
@@ -2229,6 +2243,25 @@ def _open_session(dom: str, tries: int = 3):
             time.sleep(1.5)
 
 
+def _login_step(kind: str, dom: str, sess, acct: str = "", pwd: str = "",
+                secret: str = "", manual: str = "") -> tuple[str, bytes | None]:
+    """在已就绪的会话上执行一步登录操作,统一返回 (文案, 截图 bytes 或 None)。
+
+    三个分支的返回值必须对齐,否则调用处 `m, img = ...` 会解包失败:
+    - auto_login()  返回 (文案, 截图)
+    - submit_code() 只返回截图 bytes(Streamlit 版 app.py 直接把它当图用),
+      文案在 sess.last_msg 里 —— 这里自己包成二元组,别再解包它的返回值。
+    """
+    if kind == "code":
+        k = "otp" if sess.page.query_selector(
+            "#auth-mfa-otpcode, input[name='otpCode']") is not None else "captcha"
+        return sess.last_msg, sess.submit_code(k, manual)
+    if kind == "check":
+        ok = sess.logged_in()
+        return (f"✅ {dom} 登录态已保存", None) if ok else ("未登录", sess.shot())
+    return sess.auto_login(acct, pwd, secret)
+
+
 def login_dialog():
     status = login_status()
     acct_keys = {k for k in ACCOUNTS if not k.startswith("_")}
@@ -2281,14 +2314,8 @@ def login_dialog():
                 # 这里跑在该域名的专属线程里,可以安全调用同步 Playwright
                 if kind == "login":
                     weblogin.close_domains({dom})  # 先释放档案,免得和检测引擎抢 profile 锁
-                    return _open_session(dom).auto_login(acct, pwd, secret)
-                sess = _open_session(dom)
-                if kind == "code":
-                    k = "otp" if sess.page.query_selector(
-                        "#auth-mfa-otpcode, input[name='otpCode']") is not None else "captcha"
-                    return sess.submit_code(k, manual)
-                ok = sess.logged_in()
-                return (f"✅ {dom} 登录态已保存", None) if ok else ("未登录", sess.shot())
+                return _login_step(kind, dom, _open_session(dom),
+                                   acct, pwd, secret, manual)
 
             try:
                 m, img = await _login_bound(dom, _work)
