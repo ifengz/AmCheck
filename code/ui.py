@@ -28,6 +28,13 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import logsetup
+
+# 日志与僵死取证必须在重依赖之前装好:导入期崩了也要留下可查的东西
+# (2026-09-14 僵死事故的教训 —— 关键半小时的日志全丢了)
+logsetup.install()
+log = logsetup.get_logger("ui")
+
 import nicegui.ui as ui
 from nicegui import app, run
 
@@ -432,6 +439,7 @@ async def _start_background_jobs():
     """
     monitor_scheduler.start()
     review_tracker.start()
+    log.info("后台任务已启动:定时采集 + 评价链接每日跟踪")
 
 
 app.on_startup(_start_background_jobs)
@@ -807,7 +815,11 @@ def import_table_dialog(on_done=None):
                 msg.set_text("读取上传文件失败,请重新选择")
                 return
             try:
-                rows, stats = review_import.parse_order_file(raw)
+                # **必须丢出事件循环**:解 Excel 是纯 CPU 的 Python 活,20MB 的表格
+                # 能跑几十秒到几分钟。直接 await 在这里会把整个事件循环堵死 ——
+                # 表现就是「进程活着但所有请求无响应、监听队列堆积、SIGTERM 也退不掉」,
+                # 正是 2026-09-14 僵死事故的形态(时间线里还有一次被中断的上传)。
+                rows, stats = await run.io_bound(review_import.parse_order_file, raw)
             except ValueError as ex:
                 # review_import 抛的文案本身就是给用户看的(如旧版 .xls 提示)
                 state["rows"], state["stats"] = [], None
@@ -863,7 +875,7 @@ def import_table_dialog(on_done=None):
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for r in rows:
                 r["created_at"] = stamp
-            stat = review_db.upsert_review_meta(rows, source="table")
+            stat = await run.io_bound(review_db.upsert_review_meta, rows, "table")
             summary = (f'已加入 {stat["added"]} 条新链接 · 回填业务字段 '
                        f'{stat["filled"]} 条 · 已存在 {stat["unchanged"]} 条')
             if not immediate.value:
@@ -2282,9 +2294,13 @@ def _open_session(dom: str, tries: int = 3):
     for i in range(tries):
         try:
             return weblogin.get_session(dom)
-        except Exception:
+        except Exception as e:
             if i == tries - 1:
+                log.warning("打开会话最终失败 domain=%s 尝试 %d 次: %s: %s",
+                            dom, tries, e.__class__.__name__, e)
                 raise
+            log.warning("打开会话失败,1.5s 后重试(%d/%d)domain=%s: %s",
+                        i + 1, tries, dom, e.__class__.__name__)
             time.sleep(1.5)
 
 
@@ -2388,6 +2404,7 @@ def login_dialog():
             btns[kind].props("loading")
             t0 = time.time()
             msg.set_text(HINT[kind])
+            log.info("登录操作开始 kind=%s domain=%s", kind, dom)
 
             def _tick():
                 msg.set_text(f"{HINT[kind]}(已等待 {int(time.time() - t0)} 秒)")
@@ -2423,10 +2440,13 @@ def login_dialog():
                 if kind == "check":
                     ui.notify(m, type="positive" if m.startswith("✅") else "warning")
             except Exception as e:
+                log.exception("登录操作异常 kind=%s domain=%s", kind, dom)
                 msg.set_text(f"出错:{e.__class__.__name__}: {e}")
                 ui.notify(f"登录操作失败:{e}", type="negative")
             finally:
                 ticker.cancel()
+                log.info("登录操作结束 kind=%s domain=%s 耗时=%.1fs",
+                         kind, dom, time.time() - t0)
                 for b in btns.values():
                     b.props(remove="disable loading")
                 running["on"] = False
@@ -2492,23 +2512,34 @@ def system_dialog():
         log = ui.log(max_lines=12).classes("w-full h-48")
 
         async def do_upgrade():
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "pip", "install", "-U", "playwright"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-            def _pump():
+            def _work():
+                # Popen 也要一起丢出去:fork/exec 在事件循环线程里同样是同步开销,
+                # 而且后面那段输出泵本来就是阻塞读。
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "pip", "install", "-U", "playwright"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 for line in proc.stdout:
                     log.push(line.rstrip())
                 proc.wait()
                 log.push("完成,重启服务后生效")
 
-            await run.io_bound(_pump)
+            await run.io_bound(_work)
 
         ui.button("升级 Playwright", on_click=do_upgrade) \
             .props("unelevated no-caps color=primary").classes("w-full")
-        ui.button("重启服务", on_click=lambda: (
-            os.execv(sys.executable,
-                    [sys.executable, "-m", "nicegui", "run", str(Path(__file__))]))) \
+        def _restart():
+            """用和启动时**同一条命令**重启自己:`python ui.py`。
+
+            这里原来写的是 `-m nicegui run ui.py`,而 nicegui 包没有 `__main__`
+            (实测 `python -m nicegui` 直接报 "No module named nicegui.__main__"),
+            而 `os.execv` 在报错之前就已经把旧进程映像换掉了 ——
+            等于「点一下就把服务弄死且起不来」。侧边栏「系统维护」里一点就到。
+            端口/日志仍由环境变量(AMREVIEW_PORT 等)决定,这里不重复拼参数。
+            """
+            log.warning("界面触发重启:exec %s %s", sys.executable, __file__)
+            os.execv(sys.executable, [sys.executable, str(Path(__file__))])
+
+        ui.button("重启服务", on_click=_restart) \
             .props("outline no-caps").classes("w-full")
     d.open()
 

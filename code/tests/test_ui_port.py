@@ -58,5 +58,27 @@ class UiPortTests(unittest.TestCase):
         self.assertNotIn("port=8765", src, "别把端口写回硬编码")
 
 
+class RestartEntrypointTests(unittest.TestCase):
+    """界面上的「重启服务」必须重启**自己**,不能 exec 一条跑不起来的命令。
+
+    原实现是 `os.execv(python, [python, "-m", "nicegui", "run", ui.py])`,
+    而 `python -m nicegui` 直接报 "No module named nicegui.__main__" ——
+    os.execv 在报错前就把旧进程映像换掉了,等于「点一下自杀且起不来」。
+    """
+
+    def test_restart_reexecs_the_same_script(self):
+        src = UI_PY.read_text(encoding="utf-8")
+        self.assertNotIn('"-m", "nicegui"', src,
+                         "别用 `-m nicegui` 重启:该包没有 __main__,exec 完服务就没了")
+        self.assertIn("os.execv(sys.executable, [sys.executable, str(Path(__file__))])",
+                      src, "重启要 exec 回 ui.py 本身")
+
+    def test_restart_is_logged(self):
+        """重启这类"把进程换掉"的操作必须留痕,否则事后只看到日志断了一截。"""
+        src = UI_PY.read_text(encoding="utf-8")
+        idx = src.index("os.execv(sys.executable, [sys.executable, str(Path(__file__))])")
+        self.assertIn("log.warning", src[:idx], "重启之前要先写一行日志")
+
+
 if __name__ == "__main__":
     unittest.main()
