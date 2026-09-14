@@ -82,6 +82,9 @@ body {background: var(--body); font-size: 13px; color: var(--ink);
 /* 主表格撑满剩余视口:主区至少一屏高,表格作为弹性项吃掉余量,
    不再写死 calc 高度(那会随页头行数变化在底部留白) */
 .ag-fill {min-height: 420px; flex: 1 1 auto;}
+/* 抽屉里的「跟踪历史」表格:同样吃掉剩余高度,但抽屉本身矮一些,
+   所以下限给小一点,避免撑出滚动条;min-height:0 让 flex 能真正压缩 */
+.ag-drawer-fill {flex: 1 1 0; min-height: 240px;}
 
 /* 输入控件密度 */
 .q-field--outlined .q-field__control {border-radius: 6px;}

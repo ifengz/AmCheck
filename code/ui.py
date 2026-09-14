@@ -1050,7 +1050,61 @@ def fill_review_drawer(body, drawer, review_id, on_refresh=None):
         }, html_columns=[1, 2]).classes("w-full ag-dense ag-drawer-fill")
 
 
+def history_search_index(r, url=None):
+    """检测历史页的搜索索引:把可搜索字段小写拼成一整串。
+
+    前端只做 `关键词 in _hay` 的子串匹配,所以这里必须把用户会搜的字段
+    全塞进去 —— Review ID、刷单编号、订单号、产品型号是明确要求支持的,
+    顺带把 URL/标题/作者/判定依据也带上(搜错别字时也能兜住)。
+
+    url 参数用于传入「补过兜底值」的链接(url 为空时页面会拼出
+    /gp/customer-reviews/<id>/ 这种形式),这样站点域名也进索引。
+    """
+    return " ".join(str(x or "").lower() for x in
+                    (r["review_id"], url if url is not None else r.get("url"),
+                     r.get("order_ref"), r.get("order_no"), r.get("model"),
+                     r["title"], r["author"], r["note"]))
+
+
 # ---------- 页面:历史 ----------
+
+
+def history_columns():
+    """检测历史页的列定义。
+
+    抽成模块级函数是为了让测试能直接断言「哪些列固定、有没有关掉
+    sizeColumnsToFit」——这些是用户明确要求的展示契约,不该被顺手改掉。
+
+    列序:左固定(检测时间/Review ID/刷单编号/订单号) → 可滚动主区 →
+    右固定(国家/跟踪)。agGrid 要求固定列在 columnDefs 里连续且分居两端,
+    所以业务字段必须紧跟 Review ID、国家/跟踪必须排到最后。
+    """
+    return [
+        {"headerName": "检测时间", "field": "checked", "width": 168,
+         "pinned": "left", "suppressSizeToFit": True},
+        {"headerName": "Review ID", "field": "review_id", "width": 136,
+         "pinned": "left", "tooltipField": "review_id",
+         "cellClass": "rid-copy", "suppressSizeToFit": True},
+        # 刷单编号是 6 位以内的流水号,90px 够放 6 位数字不折行
+        {"headerName": "刷单编号", "field": "order_ref", "width": 90,
+         "pinned": "left", "suppressSizeToFit": True},
+        # 订单号形如 403-6215176-3035513(19 字符),186px 才不被省略号截
+        {"headerName": "订单号", "field": "order_no", "width": 186,
+         "pinned": "left", "suppressSizeToFit": True},
+        {"headerName": "产品型号", "field": "model", "width": 180},
+        {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
+        {"headerName": "状态", "field": "status_text", "width": 84},
+        {"headerName": "星级", "field": "stars", "width": 66},
+        {"headerName": "标题", "field": "title", "minWidth": 160, "flex": 3},
+        {"headerName": "作者", "field": "author", "width": 90},
+        {"headerName": "评价日期", "field": "review_date", "width": 130},
+        {"headerName": "判定依据", "field": "note", "minWidth": 160, "flex": 2},
+        # 国家 = 站点代码(IN/AU/US…),右固定后横滚时始终可见
+        {"headerName": "国家", "field": "domain", "width": 70,
+         "pinned": "right", "suppressSizeToFit": True},
+        {"headerName": "跟踪", "field": "track", "width": 80,
+         "pinned": "right", "suppressSizeToFit": True},
+    ]
 
 
 @ui.page("/history")
@@ -1132,10 +1186,8 @@ def page_history():
                 "note": r["note"] or ("尚未检测,等每日定时跟踪跑到它"
                                       if not r["status"] else "—"),
                 "_status": status,
-                # 搜索索引:原始字段小写拼接(ID/URL/业务字段/标题/作者/备注)
-                "_hay": " ".join(str(x or "").lower() for x in
-                                 (rid, url, r.get("order_ref"), r.get("order_no"),
-                                  r.get("model"), r["title"], r["author"], r["note"])),
+                # 搜索索引:Review ID / 刷单编号 / 订单号 / 产品型号 等
+                "_hay": history_search_index(r, url),
             }
 
         def set_meta(n):
@@ -1201,36 +1253,12 @@ def page_history():
             build_cards()
             set_meta(len(shown))
 
-        # 列序:左固定(检测时间/Review ID/刷单编号/订单号) → 可滚动主区 →
-        # 右固定(国家/跟踪)。agGrid 要求固定列在 columnDefs 里连续且分居两端,
-        # 所以业务字段必须紧跟 Review ID、国家/跟踪必须排到最后。
-        # auto_size_columns=False 是关键:nicegui 默认会调 sizeColumnsToFit(),
-        # 把非固定列按剩余宽度硬压(实测被压到 36px、表头全是省略号),
-        # 关掉后各列保持声明宽度、放不下就横向滚动,固定列始终完整可见。
+        # 列定义见 history_columns()。auto_size_columns=False 是关键:
+        # nicegui 默认会调 sizeColumnsToFit(),把非固定列按剩余宽度硬压
+        # (实测被压到 36px、表头全是省略号);关掉后各列保持声明宽度、
+        # 放不下就横向滚动,左右固定列始终完整可见。
         grid = ui.aggrid({
-            "columnDefs": [
-                {"headerName": "检测时间", "field": "checked", "width": 168,
-                 "pinned": "left", "suppressSizeToFit": True},
-                {"headerName": "Review ID", "field": "review_id", "width": 136,
-                 "pinned": "left", "tooltipField": "review_id",
-                 "cellClass": "rid-copy", "suppressSizeToFit": True},
-                {"headerName": "刷单编号", "field": "order_ref", "width": 90,
-                 "pinned": "left", "suppressSizeToFit": True},
-                {"headerName": "订单号", "field": "order_no", "width": 186,
-                 "pinned": "left", "suppressSizeToFit": True},
-                {"headerName": "产品型号", "field": "model", "width": 180},
-                {"headerName": "链接", "field": "link", "width": 68, "sortable": False},
-                {"headerName": "状态", "field": "status_text", "width": 84},
-                {"headerName": "星级", "field": "stars", "width": 66},
-                {"headerName": "标题", "field": "title", "minWidth": 160, "flex": 3},
-                {"headerName": "作者", "field": "author", "width": 90},
-                {"headerName": "评价日期", "field": "review_date", "width": 130},
-                {"headerName": "判定依据", "field": "note", "minWidth": 160, "flex": 2},
-                {"headerName": "国家", "field": "domain", "width": 70,
-                 "pinned": "right", "suppressSizeToFit": True},
-                {"headerName": "跟踪", "field": "track", "width": 80,
-                 "pinned": "right", "suppressSizeToFit": True},
-            ],
+            "columnDefs": history_columns(),
             "rowData": [],
             "defaultColDef": {"sortable": True, "resizable": True},
             "rowHeight": 30,
