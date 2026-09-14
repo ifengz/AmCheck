@@ -117,13 +117,16 @@ def link_cell(url: str) -> str:
     """表格「链接」列:新窗口打开 + 一键复制(行内小图标)。
 
     事件带 stopPropagation,避免触发 AGGrid 的 cellClicked 行详情弹窗。
+
+    文案统一叫「评价页面 / 评价链接」——这个函数只用于评价链接列
+    (检测页 681 行、历史页 1188 行),不含商品链接,所以不会歧义。
     """
     u = html_mod.escape(url, quote=True)
     return (f'<span class="link-act">'
-            f'<button title="打开原页面" onclick="window.open(\'{u}\',\'_blank\')">'
+            f'<button title="打开评价页面" onclick="window.open(\'{u}\',\'_blank\')">'
             f'↗</button>'
-            f'<button title="复制链接" '
-            f'onclick="copyText(\'{u}\');showCopyToast(\'链接已复制\')">'
+            f'<button title="复制评价链接" '
+            f'onclick="copyText(\'{u}\');showCopyToast(\'评价链接已复制\')">'
             f'⧉</button>'
             f'</span>')
 
@@ -749,7 +752,8 @@ def detail_dialog(r: dict):
         if r.get("screenshot") and Path(r["screenshot"]).exists():
             ui.image(r["screenshot"]).classes("w-full rounded-md")
         with ui.row():
-            ui.button("打开原页面", on_click=lambda: ui.open(r["url"], new_tab=True)) \
+            # 这里打开的是评价链接,与抽屉里的文案保持一致
+            ui.button("打开评价页面", on_click=lambda: ui.open(r["url"], new_tab=True)) \
                 .props("outline no-caps dense icon=open_in_new")
             if len(review_history_timeline(r["review_id"])) > 1:
                 ui.button("历史轨迹").props("outline no-caps dense")
@@ -1556,10 +1560,12 @@ def page_monitor():
             html(f'<div class="pg-meta">基线 {(base.get("checked_at") or "")[5:16]} → '
                  f'{(cur.get("checked_at") or "")[5:16]} · {_diff_line(base, cur)}</div>')
             ui.separator()
-            # 操作区:原页面 / 确认基线 / 删除监控(放在切卡上方,不用滚到底)
+            # 操作区:商品页面 / 确认基线 / 删除监控(放在切卡上方,不用滚到底)
+            # 注意这里是**商品**链接(ASIN 页),不是评价链接,所以不能跟着
+            # 评价页那套文案改成「打开评价页面」——原来叫「打开原页面」指代不清。
             with ui.row().classes("w-full items-center justify-between"):
                 if p.get("url"):
-                    ui.button("打开原页面",
+                    ui.button("打开商品页面",
                               on_click=lambda u=p["url"]: ui.open(u, new_tab=True)) \
                         .props("outline no-caps dense icon=open_in_new")
                 with ui.row().classes("items-center gap-2"):
@@ -2576,6 +2582,10 @@ def _report_exception(e: Exception) -> None:
 app.on_exception(_report_exception)
 
 
-ui.run(title="AmReview 评价检测", port=8765, reload=False, show=False,
+# 端口可用环境变量覆盖:验证脚本/本地起第二份实例时不必抢占 8765,
+# 也就不会把别人正在跑的实例踢掉。
+PORT = int(os.environ.get("AMREVIEW_PORT", "8765"))
+
+ui.run(title="AmReview 评价检测", port=PORT, reload=False, show=False,
        storage_secret="amreview-secret", favicon="🔍",
        show_welcome_message=False)
