@@ -11,11 +11,15 @@
 结果就是「本地跑得好好的,全新部署直接 ModuleNotFoundError: nicegui」。
 这类问题本地很难察觉(venv 早就装好了),所以用测试钉住。
 
-守四条:
+守五条:
 1. requirements.txt 声明的包,必须都能在 lock 里找到(本文件的核心);
-2. lock 必须是精确版本、且排序稳定(生成方式是 `pip freeze | sort -f`);
+2. lock 必须是可解析的精确版本、且排序稳定(生成方式见 `code/gen_lock.sh`);
 3. 核心运行栈必须显式出现在 lock 里(防止又一次整体漏掉);
-4. 代码里 import 的第三方包,必须要么已声明,要么在下面登记过原因。
+4. 代码里 import 的第三方包,必须要么已声明,要么在下面登记过原因;
+5. 同一个包出现多条 pin 时,环境标记必须齐全且互斥(numpy 的版本窗口)。
+
+第 5 条是补上来的:lock 的失效不止「内容过期」一种,还有「Python 版本不匹配」——
+numpy 2.0.x 只到 3.12,写死单条 pin 会让 3.13 上的安装转去源码编译并失败。
 """
 
 import re
@@ -79,15 +83,24 @@ def _parse_requirements(path: Path) -> dict:
     return out
 
 
+def _lock_lines(path: Path) -> list:
+    """lock 里所有有效行(去注释、去空行)。"""
+    return [l.strip() for l in path.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.strip().startswith("#")]
+
+
 def _parse_lock(path: Path) -> dict:
+    """{归一化包名: 版本}。
+
+    环境标记会被剥掉 —— 同一个包按 Python 版本可能有多条 pin
+    (numpy 就是这样),这里只关心「包在不在、锁的是哪个版本」。
+    """
     out = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        name, sep, ver = line.partition("==")
+    for line in _lock_lines(path):
+        spec = line.split(";", 1)[0].strip()
+        name, sep, ver = spec.partition("==")
         if sep:
-            out[_norm(name)] = ver.strip()
+            out.setdefault(_norm(name), ver.strip())
     return out
 
 
@@ -165,8 +178,7 @@ class RequirementsConsistencyTests(unittest.TestCase):
         self.assertEqual(
             missing, [],
             f"这些包在 requirements.txt 里声明了,但 requirements.lock.txt 里没有:"
-            f"{missing}\n→ 重新生成:cd code && .venv/bin/pip freeze | sort -f "
-            f"> requirements.lock.txt")
+            f"{missing}\n→ 重新生成:cd code && bash gen_lock.sh")
 
     def test_core_runtime_stack_is_locked(self):
         """核心运行栈必须显式在 lock 里 —— 缺一个全新部署就起不来。"""
@@ -175,23 +187,93 @@ class RequirementsConsistencyTests(unittest.TestCase):
                          f"核心运行依赖没进 lock 文件:{missing}")
 
     def test_lock_lines_are_exact_pins(self):
-        """lock 只放 `name==version`,不能有范围约束(否则锁不住)。"""
+        """lock 每行都必须是可解析的精确 pin(`name==version`,可带环境标记)。
+
+        用 packaging 真正解析,而不是正则 —— 标记里可能有引号、比较符、
+        and/or 组合,正则很容易放行错的东西。
+        """
+        from packaging.requirements import InvalidRequirement, Requirement
+
         bad = []
-        for raw in REQ_LOCK.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
+        for line in _lock_lines(REQ_LOCK):
+            try:
+                req = Requirement(line)
+            except InvalidRequirement as exc:
+                bad.append(f"{line}   ← 解析失败: {exc}")
                 continue
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9._+!-]*",
-                                line):
-                bad.append(line)
-        self.assertEqual(bad, [], f"lock 文件里有非精确版本行:{bad}")
+            spec = list(req.specifier)
+            if len(spec) != 1 or spec[0].operator != "==":
+                bad.append(f"{line}   ← 不是单一 == 精确版本")
+        self.assertEqual(bad, [], "lock 里这些行不是合法精确 pin:\n" + "\n".join(bad))
 
     def test_lock_is_sorted(self):
         """生成方式是 `pip freeze | sort -f`,排序稳定才不会有假 diff。"""
-        lines = [l.strip() for l in REQ_LOCK.read_text(encoding="utf-8").splitlines()
-                 if l.strip() and not l.strip().startswith("#")]
+        lines = _lock_lines(REQ_LOCK)
         self.assertEqual(lines, sorted(lines, key=str.lower),
-                         "lock 文件没按包名排序,重新生成时请用 `sort -f`")
+                         "lock 文件没按包名排序,重新生成请用 `bash gen_lock.sh`")
+
+    def test_duplicate_pins_carry_markers(self):
+        """同一个包出现多条 pin 时,每条都必须带环境标记。
+
+        现实案例:numpy 2.0.x 支持 3.9~3.12 但没有 3.13 的轮子,3.13 要换 2.1.x,
+        所以必须写成两条带 `python_version` 标记的 pin。少了标记就变成
+        「装哪个看 pip 心情」,而且是静默的。
+        """
+        from packaging.requirements import Requirement
+
+        seen = {}
+        for line in _lock_lines(REQ_LOCK):
+            req = Requirement(line)
+            seen.setdefault(_norm(req.name), []).append((line, req.marker))
+
+        problems = []
+        for name, entries in seen.items():
+            if len(entries) < 2:
+                continue
+            for line, marker in entries:
+                if marker is None:
+                    problems.append(f"{name} 有多条 pin,但这条没有环境标记:{line}")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_duplicate_pin_markers_do_not_overlap(self):
+        """同一包的多条 pin,标记必须互斥 —— 否则某个 Python 上会同时命中两条。
+
+        这条能挡住「标记写错方向」这类静默错误,比如把两条都写成
+        `python_version >= "3.9"`。
+        """
+        from packaging.markers import Marker
+        from packaging.requirements import Requirement
+
+        versions = ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        seen = {}
+        for line in _lock_lines(REQ_LOCK):
+            req = Requirement(line)
+            seen.setdefault(_norm(req.name), []).append((line, req.marker))
+
+        problems = []
+        for name, entries in seen.items():
+            if len(entries) < 2:
+                continue
+            for ver in versions:
+                env = {"python_version": ver, "python_full_version": ver + ".0"}
+                hits = [ln for ln, m in entries
+                        if m is None or Marker(str(m)).evaluate(env)]
+                if len(hits) > 1:
+                    problems.append(
+                        f"{name} 在 Python {ver} 上同时命中 {len(hits)} 条:{hits}")
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_numpy_pin_covers_both_windows(self):
+        """numpy 的版本窗口是真实约束,不能退回单条 pin。
+
+        numpy 2.0.x → 3.9~3.12;2.1.x → 3.10~3.13。
+        一个精确版本盖不住 3.9 和 3.13 两端,写死单条会让某一端退化成源码编译。
+        """
+        lines = [l for l in _lock_lines(REQ_LOCK) if l.lower().startswith("numpy==")]
+        self.assertGreaterEqual(len(lines), 2, f"numpy 应该有分版本的多条 pin,实际:{lines}")
+        for line in lines:
+            self.assertIn("python_version", line,
+                          f"numpy 的 pin 必须带 python_version 标记:{line}")
 
     def test_no_undeclared_third_party_imports(self):
         """代码 import 的第三方包必须已声明,或在 ALLOWED_UNDECLARED 里登记过。
@@ -234,8 +316,8 @@ class RequirementsConsistencyTests(unittest.TestCase):
                 drift.append(f"{dist}: lock={locked} 实际={installed}")
         self.assertEqual(
             drift, [],
-            "lock 与实测环境脱节,重新生成:cd code && .venv/bin/pip freeze "
-            "| sort -f > requirements.lock.txt\n" + "\n".join(drift))
+            "lock 与实测环境脱节,重新生成:cd code && bash gen_lock.sh\n"
+            + "\n".join(drift))
 
 
 if __name__ == "__main__":
