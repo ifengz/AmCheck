@@ -269,7 +269,7 @@ class PlaywrightAdapter(BaseAdapter):
         if image_url.startswith("http") is False:
             image_url = ""
 
-        price_text, price_val, currency = _extract_price(page)
+        price_text, price_val, currency = _extract_price(page, domain)
 
         rating = None
         el = page.query_selector("#acrPopover")
@@ -545,37 +545,83 @@ def _clean(s) -> str:
     return _re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def _extract_price(page) -> tuple[str, float | None, str]:
-    """从商品页取价格串/数值/货币。优先买盒价,退而取 any a-offscreen。"""
+def _extract_price(page, domain: str = "") -> tuple[str, float | None, str]:
+    """从商品页取价格串/数值/货币。优先买盒价,退而取 any a-offscreen。
+
+    候选**全收再挑**,不是拿第一个就返回:线上实测同页会同时有
+    ".a-price" 整块(whole/fraction 两个 span,inner_text 会把小数点挤丢
+    → "US$4997" 这种拼接残渣)和带正确小数点的 ".a-offscreen"。
+    残渣形态(纯数字无分隔)的价格写进基线,每轮都报假「价格异常」。
+    """
+    # 跨选择器收齐再挑:线上实测首位选择器(#corePrice_feature_div)偶尔
+    # 只剩 whole+fraction 拼接残渣("US$49"+"97"→"US$4997"),而后位的
+    # .a-price .a-offscreen 才有带点的完整价 —— 组内挑不到时不能就地返回。
+    cands = []
     for sel in ('#corePrice_feature_div .a-offscreen',
                 '#corePriceDisplay_desktop_feature_div .a-offscreen',
                 '#corePriceDisplay_mobile_feature_div .a-offscreen',
                 '.a-price .a-offscreen', '#priceblock_dealprice',
                 '#priceblock_ourprice'):
-        el = page.query_selector(sel)
-        if el:
-            s = (el.inner_text() or "").strip()
+        try:
+            els = page.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els:
+            try:
+                s = _clean(el.inner_text())
+            except Exception:
+                continue
             if s:
-                return _parse_price(s)
-    return "", None, ""
+                cands.append(s)
+    if not cands:
+        return "", None, ""
+    # 带「数字[.,]数字」的才是完整价;全都没有时退回第一个 ——
+    # 日本站 ¥500 这类合法无分隔整数价也走这条,别丢数
+    pick = next((s for s in cands if re.search(r"\d[.,]\d", s)), cands[0])
+    return _parse_price(pick, domain)
 
 
-def _parse_price(s: str) -> tuple[str, float | None, str]:
-    import re as _re
-    m = _re.search(r"([^\d\s,.]*)\s*([\d,]+(?:\.\d+)?)", s)
+def _num_value(num: str) -> float | None:
+    """从 "105.99" / "105,99" / "1.279,90" / "1,05,999" 推数值。
+
+    规则(格式判断,不绑站点 —— 页面版本/地区泄露都会换格式):
+    - 最后一个分隔符后跟 1~2 位 → 它是小数点(欧式逗号价 "105,99"=105.99)
+    - 否则(3 位或纯数字)→ 分隔符全是千分位 ("1,05,999"=105999, "1.000"=1000)
+    """
+    num = num.strip()
+    if not re.fullmatch(r"\d[\d.,]*", num):
+        return None
+    last = max(num.rfind("."), num.rfind(","))
+    if last == -1:
+        return float(num)
+    tail = num[last + 1:]
+    if len(tail) < 3:                       # 小数点在后
+        intp = num[:last].replace("," if num[last] == "." else ".", "")
+        try:
+            return float(intp + "." + tail)
+        except ValueError:                  # "1,.5" 之类畸形
+            return None
+    return float(num.replace(",", "").replace(".", ""))
+
+
+# 站点 → 货币符号:页面一个符号都没抓到时的兜底(旧代码硬编码 ₹,
+# 早于多站点上线,现在 US/AU/JP 会被标错币种)。
+DOMAIN_CURRENCY = {
+    "amazon.com": "$", "amazon.ca": "C$", "amazon.com.mx": "MX$",
+    "amazon.com.au": "A$", "amazon.co.jp": "¥", "amazon.in": "₹",
+    "amazon.com.br": "R$", "amazon.co.uk": "£",
+    "amazon.de": "€", "amazon.fr": "€", "amazon.es": "€", "amazon.it": "€",
+}
+
+
+def _parse_price(s: str, domain: str = "") -> tuple[str, float | None, str]:
+    m = re.search(r"([^\d,.]*)\s*([\d.,]+)", s)
     if not m:
-        return s, None, ""
-    cur, num = m.group(1), m.group(2)
-    val = float(num.replace(",", ""))
-    # 货币符号在数字前后都可能有
-    cur = cur.strip()
-    if not cur:
-        return s, val, _guess_currency(num)
-    return s, val, cur
-
-
-def _guess_currency(num: str) -> str:
-    return "₹"  # 默认印度卢比(当前场景全走 amazon.in)
+        return s, None, DOMAIN_CURRENCY.get(domain, "")
+    cur, num = m.group(1).strip(), m.group(2)
+    val = _num_value(num)
+    # 货币符号在数字前后都可能有;抓不到按站点兜底
+    return s, val, cur or DOMAIN_CURRENCY.get(domain, "")
 
 
 def _browser_args() -> list[str]:
