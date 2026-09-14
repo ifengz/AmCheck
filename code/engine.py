@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re
@@ -21,8 +22,15 @@ from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
 
+log = logging.getLogger("engine")
+
 PROFILE_ROOT = Path.home() / ".amreview" / "profile"
 SHOT_DIR = Path(__file__).parent / "screenshots"
+
+# close 超过这个秒数就打警告:Playwright 的 close 卡死是常见事故点,
+# 而同步对象**不能**丢到别的线程去超时回收(会 "Cannot switch to a different thread"),
+# 所以这里只能「计时告警」,真正的兜底靠外部 watchdog 强杀。
+SLOW_CLOSE_WARN = float(os.environ.get("AMREVIEW_SLOW_CLOSE_WARN", "15"))
 
 
 def _browser_args() -> list[str]:
@@ -283,6 +291,25 @@ def check_one(page: Page, ref: ReviewRef, shot_dir: Path) -> dict:
     return result
 
 
+def _timed_close(obj, what: str, method: str = "close") -> None:
+    """关一个 Playwright 对象并计时;卡住或抛错都不能影响上层。
+
+    **别想着给它加超时**:Playwright 同步对象换线程就报
+    ``Cannot switch to a different thread``,丢进线程池回收是行不通的。
+    所以这里只做「计时 + 告警」,真正的兜底是外部 watchdog 的强杀。
+    """
+    t0 = time.time()
+    try:
+        getattr(obj, method)()
+    except Exception as e:
+        log.warning("关闭 %s 出错: %s: %s", what, e.__class__.__name__, e)
+        return
+    dt = time.time() - t0
+    if dt >= SLOW_CLOSE_WARN:
+        log.warning("关闭 %s 耗时 %.1fs(阈值 %.0fs,留意僵死)",
+                    what, dt, SLOW_CLOSE_WARN)
+
+
 class ReviewChecker:
     """按域名复用持久化浏览器档案,批量检测。
 
@@ -302,6 +329,7 @@ class ReviewChecker:
     def _context(self, domain: str):
         if self._pw is None:
             self._pw = sync_playwright().start()
+            log.info("Playwright 已启动")
         if domain not in self._contexts:
             profile = self.profile_root / domain
             profile.mkdir(parents=True, exist_ok=True)
@@ -309,10 +337,17 @@ class ReviewChecker:
                           locale="en-US", viewport={"width": 1280, "height": 900},
                           args=_browser_args())
             # 优先本机 Chrome(实测可穿 edgex guard),无 Chrome 环境回退内置 Chromium
+            t0 = time.time()
+            log.info("启动浏览器 domain=%s profile=%s", domain, profile)
             try:
                 ctx = self._pw.chromium.launch_persistent_context(channel="chrome", **kwargs)
-            except Exception:
+                log.info("浏览器就绪 domain=%s channel=chrome 耗时=%.1fs",
+                         domain, time.time() - t0)
+            except Exception as e:
+                log.info("本机 Chrome 不可用(%s),回退内置 Chromium", e.__class__.__name__)
                 ctx = self._pw.chromium.launch_persistent_context(**kwargs)
+                log.info("浏览器就绪 domain=%s channel=chromium 耗时=%.1fs",
+                         domain, time.time() - t0)
             self._contexts[domain] = ctx
         return self._contexts[domain]
 
@@ -323,19 +358,26 @@ class ReviewChecker:
     def check_batch(self, refs: list[ReviewRef], delay: tuple = (3, 5),
                     on_result=None) -> list[dict]:
         """批量检测评价链接。"""
+        t_all = time.time()
+        log.info("批量检测开始 共 %d 条", len(refs))
         results = []
         for i, ref in enumerate(refs):
             ctx = self._context(ref.domain)
             page = ctx.new_page()
+            t0 = time.time()
             try:
                 r = check_one(page, ref, self.shot_dir)
             finally:
-                page.close()
+                _timed_close(page, f"page[{ref.review_id}]")
             results.append(r)
+            log.info("检测 %d/%d %s %s → %s 耗时=%.1fs", i + 1, len(refs),
+                     ref.domain, ref.review_id, r.get("status"), time.time() - t0)
             if on_result:
                 on_result(i, ref, r)
             if i < len(refs) - 1:
                 time.sleep(random.uniform(*delay))
+        log.info("批量检测结束 共 %d 条 耗时=%.1fs", len(results),
+                 time.time() - t_all)
         return results
 
     # 为未来扩展预留：产品链接批量检测
@@ -365,15 +407,14 @@ class ReviewChecker:
     #     pass
 
     def close(self):
-        for ctx in self._contexts.values():
-            try:
-                ctx.close()
-            except Exception:
-                pass
+        t_all = time.time()
+        for dom, ctx in list(self._contexts.items()):
+            _timed_close(ctx, f"context[{dom}]")
         if self._pw:
-            self._pw.stop()
+            _timed_close(self._pw, "playwright", method="stop")
             self._pw = None
         self._contexts.clear()
+        log.info("检测引擎已关闭 耗时=%.1fs", time.time() - t_all)
 
     def __enter__(self):
         return self

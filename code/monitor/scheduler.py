@@ -12,11 +12,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from datetime import datetime
 
 from . import store
+
+log = logging.getLogger("monitor-scheduler")
 
 _TICK = 30.0  # 轮询配置的粒度(秒)
 
@@ -68,6 +71,7 @@ class Scheduler:
             try:
                 self._tick()
             except Exception as e:
+                log.exception("定时采集轮次异常,线程继续存活")
                 store.set_setting(self.db, "schedule_last_stat",
                                   f"失败 {e.__class__.__name__}: {e}")
             self._stop.wait(_TICK)
@@ -91,3 +95,6 @@ class Scheduler:
         store.set_setting(self.db, "schedule_last_stat",
                           f"检查 {r['checked']} · 异常 {r['anomalies']}"
                           + (f" · 推送 {r['pushed']}" if r.get("pushed") else ""))
+        log.info("定时采集完成:检查 %s 条 · 异常 %s 条%s", r["checked"],
+                 r["anomalies"],
+                 f" · 推送 {r['pushed']}" if r.get("pushed") else "")

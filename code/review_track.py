@@ -19,11 +19,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from datetime import datetime
 
 import review_db as rdb
 from engine import ReviewChecker, ReviewRef
+
+log = logging.getLogger("review-track")
 
 TICK = 120.0          # 线程轮询粒度(秒)
 _BATCH_MIN, _BATCH_MAX = 1, 20
@@ -76,6 +80,9 @@ def _run_batch(db_path, settings_db, picks: list[dict]) -> list[dict]:
             for m in picks if m.get("domain") and m.get("url")]
     if not refs:
         return []
+    t0 = time.time()
+    log.info("跟踪批次开始 共 %d 条:%s", len(refs),
+             ", ".join(r.review_id for r in refs))
     checker = ReviewChecker()
     try:
         results = checker.check_batch(refs)
@@ -89,6 +96,7 @@ def _run_batch(db_path, settings_db, picks: list[dict]) -> list[dict]:
             stopped.append(r["review_id"])
     for r in results:
         r["_stopped"] = r["review_id"] in stopped
+    log.info("跟踪批次结束 共 %d 条 耗时=%.1fs", len(results), time.time() - t0)
     return results
 
 
@@ -99,6 +107,7 @@ def run_once(db_path, settings_db, limit: int | None = None,
     force=True 时忽略"当日排期是否到点",按排期顺序取前 N 条(手动触发用)。
     """
     if not _run_lock.acquire(blocking=False):
+        log.info("已有跟踪轮次在进行中,本次跳过")
         return {"checked": 0, "note": "已有一轮跟踪在进行中"}
     try:
         cfg = get_cfg(settings_db)
@@ -112,6 +121,7 @@ def run_once(db_path, settings_db, limit: int | None = None,
             picks = due_links(db_path, settings_db)[:n]
         if not picks:
             return {"checked": 0, "note": "本轮没有到点的链接"}
+        log.info("跟踪轮次开始 force=%s 取 %d 条", force, len(picks))
         results = _run_batch(db_path, settings_db, picks)
         tally: dict[str, int] = {}
         for r in results:
@@ -125,7 +135,7 @@ def run_once(db_path, settings_db, limit: int | None = None,
         if stopped:
             stat += f" · 停止跟踪 {len(stopped)} 条(连续已删)"
         ms.set_setting(settings_db, "review_track_last_stat", stat)
-        print(f"[review-track] {stat}", flush=True)
+        log.info(stat)
         return {"checked": len(results), "tally": tally, "stopped": stopped,
                 "results": results}
     finally:
@@ -157,6 +167,7 @@ class ReviewTracker:
             try:
                 self._tick()
             except Exception as e:            # 单轮出错不拖垮线程
+                log.exception("跟踪轮次异常,线程继续存活")
                 try:
                     _settings().set_setting(
                         self.settings_db, "review_track_last_stat",

@@ -16,6 +16,8 @@ code/accounts.json
 code/history.db
 code/screenshots/
 code/graphify-out/
+# 本地日志(服务器上落 /www/wwwlogs/amcheck,本地回退到 code/logs)
+code/logs/
 # NiceGUI 的 storage 目录(启动时自动生成,每个访客一个 json)
 .nicegui/
 
