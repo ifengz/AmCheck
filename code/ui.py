@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
 import html as html_mod
 import io
@@ -2243,6 +2244,17 @@ def _open_session(dom: str, tries: int = 3):
             time.sleep(1.5)
 
 
+def _png_data_url(img: bytes) -> str:
+    """把 Playwright 截图 bytes 转成 data URL。
+
+    ui.image() 只接受 str/Path/PIL 图(NiceGUI 3.6 的签名是
+    `Union[str, Path, PIL_Image]`),直接喂 bytes 会在发消息时抛
+    "Type is not JSON serializable: bytes" —— 元素建出来了但整批更新发不出去,
+    截图永远显示不出来,还会连带丢掉同一批里的其他界面更新。
+    """
+    return "data:image/png;base64," + base64.b64encode(img).decode("ascii")
+
+
 def _login_step(kind: str, dom: str, sess, acct: str = "", pwd: str = "",
                 secret: str = "", manual: str = "") -> tuple[str, bytes | None]:
     """在已就绪的会话上执行一步登录操作,统一返回 (文案, 截图 bytes 或 None)。
@@ -2323,7 +2335,7 @@ def login_dialog():
                 img_holder.clear()
                 if img:
                     with img_holder:
-                        ui.image(img).classes("w-full rounded-md")
+                        ui.image(_png_data_url(img)).classes("w-full rounded-md")
                 if kind == "check":
                     ui.notify(m, type="positive" if m.startswith("✅") else "warning")
             except Exception as e:

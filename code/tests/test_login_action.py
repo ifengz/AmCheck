@@ -8,6 +8,7 @@ bytes(Streamlit 版 ``app.py`` 直接把它当图用),而 ``ui.py`` 里按
 这里用假会话跑,不启浏览器、不启服务。
 """
 
+import base64
 import sys
 import unittest
 from pathlib import Path
@@ -91,6 +92,33 @@ class LoginActionTests(unittest.TestCase):
                                    "a@b.com", "pw", "secret", "123456")
                 self.assertIsInstance(result, tuple)
                 self.assertEqual(len(result), 2)
+
+
+class LoginScreenshotTests(unittest.TestCase):
+    """回归:ui.image() 不接受 bytes,截图必须先转 data URL。
+
+    NiceGUI 3.6 的 ui.image 签名是 Union[str, Path, PIL_Image];直接喂
+    page.screenshot() 的 bytes,元素能建出来,但发消息时 orjson 抛
+    "Type is not JSON serializable: bytes" —— 截图永远显示不出来,
+    还会连带丢掉同一批里的其他界面更新(整批 update 都没发出去)。
+    """
+
+    def setUp(self):
+        self.ns = _load_ui_module()
+
+    def test_png_data_url_round_trips(self):
+        png = b"\x89PNG\r\n\x1a\n"
+        url = self.ns["_png_data_url"](png)
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(url.split(",", 1)[1]), png)
+
+    def test_raw_bytes_break_the_payload_but_data_url_does_not(self):
+        from nicegui import json as ngjson
+
+        with self.assertRaises(TypeError):
+            ngjson.dumps({"src": b"\x89PNG"})          # 老写法:发不出去
+        payload = ngjson.dumps({"src": self.ns["_png_data_url"](b"\x89PNG")})
+        self.assertIn("data:image/png;base64,", payload)
 
 
 if __name__ == "__main__":
