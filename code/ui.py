@@ -196,6 +196,16 @@ def login_status():
 _login_status_cache = None
 
 
+def forget_login_status() -> None:
+    """登录成功落盘后调一次,让下一次渲染重新读 storage_state.json。
+
+    不调的话侧边栏会一直吃 30s 缓存(而且刚登完那一刻页面本来也不会自己重渲染),
+    用户会觉得"我明明登上了,怎么还显示未登录"。
+    """
+    global _login_status_cache
+    _login_status_cache = None
+
+
 def load_accounts():
     if ACCOUNTS_FILE.exists():
         try:
@@ -2272,34 +2282,62 @@ def _open_session(dom: str, tries: int = 3):
             time.sleep(1.5)
 
 
-def _png_data_url(img: bytes) -> str:
-    """把 Playwright 截图 bytes 转成 data URL。
+def _shot_data_url(img: bytes, max_side: int = 1280, quality: int = 75) -> str:
+    """把 Playwright 截图 bytes 转成 ui.image 能吃的 data URL。
 
-    ui.image() 只接受 str/Path/PIL 图(NiceGUI 3.6 的签名是
-    `Union[str, Path, PIL_Image]`),直接喂 bytes 会在发消息时抛
-    "Type is not JSON serializable: bytes" —— 元素建出来了但整批更新发不出去,
-    截图永远显示不出来,还会连带丢掉同一批里的其他界面更新。
+    两件事少一件截图就出不来:
+    1. ui.image() 只接受 str/Path/PIL 图(NiceGUI 3.6 签名是
+       ``Union[str, Path, PIL_Image]``)。喂 bytes 时 ``SourceElement._set_props()``
+       里的 ``is_file()`` 会走到 ``Path(bytes)`` 并抛
+       ``TypeError: argument should be a str object or an os.PathLike object``
+       —— helpers.is_file() 只吞 OSError,不吞 TypeError。
+       (NiceGUI 对 ``data:`` 开头的字符串有专门短路,所以 data URL 是官方支持的源。)
+    2. 服务器在远端,1280x900 的 PNG 原图 base64 后可能几百 KB,
+       每次点击都推这么大一坨不划算。统一缩到 max_side 内并转 JPEG。
     """
-    return "data:image/png;base64," + base64.b64encode(img).decode("ascii")
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(img)).convert("RGB")
+        if max(im.size) > max_side:
+            im.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=quality)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        # Pillow 缺失或图坏了:退回 PNG 原图,别让"显示截图"这一步把整个操作拖失败
+        return "data:image/png;base64," + base64.b64encode(img).decode("ascii")
 
 
 def _login_step(kind: str, dom: str, sess, acct: str = "", pwd: str = "",
                 secret: str = "", manual: str = "") -> tuple[str, bytes | None]:
     """在已就绪的会话上执行一步登录操作,统一返回 (文案, 截图 bytes 或 None)。
 
-    三个分支的返回值必须对齐,否则调用处 `m, img = ...` 会解包失败:
-    - auto_login()  返回 (文案, 截图)
-    - submit_code() 只返回截图 bytes(Streamlit 版 app.py 直接把它当图用),
-      文案在 sess.last_msg 里 —— 这里自己包成二元组,别再解包它的返回值。
+    两个坑:
+    1. 三个分支的返回值必须对齐,否则调用处 `m, img = ...` 会解包失败:
+       auto_login() 返回 (文案, 截图),而 submit_code() 只返回截图 bytes
+       (Streamlit 版 app.py 直接把它当图用),文案在 sess.last_msg 里。
+    2. 这一步走完只要是已登录态,就必须 sess.finish() 收尾。finish() 做两件事:
+       a) 写 storage_state.json —— login_status()(侧边栏 3/6 计数)和 app.py
+          的登录态判定读的都是这个文件;不写的话按钮提示"已保存"其实什么都没存,
+          侧边栏永远显示未登录。
+       b) 关掉浏览器释放档案目录 —— 不释放的话,检测引擎随后
+          launch_persistent_context(user_data_dir=同一个档案)会撞 profile 锁。
     """
     if kind == "code":
-        k = "otp" if sess.page.query_selector(
+        field = "otp" if sess.page.query_selector(
             "#auth-mfa-otpcode, input[name='otpCode']") is not None else "captcha"
-        return sess.last_msg, sess.submit_code(k, manual)
-    if kind == "check":
-        ok = sess.logged_in()
-        return (f"✅ {dom} 登录态已保存", None) if ok else ("未登录", sess.shot())
-    return sess.auto_login(acct, pwd, secret)
+        msg, img = sess.last_msg, sess.submit_code(field, manual)
+    elif kind == "check":
+        if not sess.logged_in():
+            return f"未登录:{dom} 还没登上,看截图确认停在哪一步", sess.shot()
+        msg, img = "", None          # 已登录,文案交给下面的统一成功分支
+    else:
+        msg, img = sess.auto_login(acct, pwd, secret)
+
+    if sess.logged_in():
+        sess.finish()
+        return f"✅ {dom} 登录成功,登录态已保存", None
+    return msg, img
 
 
 def login_dialog():
@@ -2363,7 +2401,19 @@ def login_dialog():
                 img_holder.clear()
                 if img:
                     with img_holder:
-                        ui.image(_png_data_url(img)).classes("w-full rounded-md")
+                        ui.image(_shot_data_url(img)).classes("w-full rounded-md")
+                if m.startswith("✅"):
+                    # 登录态已落盘:清缓存,让下拉框和侧边栏的计数立刻反映出来
+                    forget_login_status()
+                    fresh = login_status()
+                    sel.set_options({x: f"{x} · {'已登录' if fresh.get(x, {}).get('ok') else '未登录'}"
+                                     for x in domains})
+                    try:
+                        # refresh() 返回 AwaitableResponse:await 才会同步刷完。
+                        # 不 await 靠 __del__ 兜底也能刷,但时机不确定。
+                        await sidebar_nav.refresh()
+                    except Exception:
+                        pass  # 刷新侧边栏只是锦上添花,失败不影响登录结果
                 if kind == "check":
                     ui.notify(m, type="positive" if m.startswith("✅") else "warning")
             except Exception as e:
