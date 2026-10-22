@@ -2630,20 +2630,34 @@ def system_dialog():
         log = ui.log(max_lines=12).classes("w-full h-48")
 
         async def do_upgrade():
-            def _work():
-                # Popen 也要一起丢出去:fork/exec 在事件循环线程里同样是同步开销,
-                # 而且后面那段输出泵本来就是阻塞读。
+            def _run(cmd, label):
+                # 旗标必须带:install 默认会回收"没有安装记录引用"的浏览器目录,
+                # 而这台服务器的 ms-playwright 是多项目共用的。
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "pip", "install", "-U", "playwright"],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    env={**os.environ, "PLAYWRIGHT_SKIP_BROWSER_GC": "1"})
                 for line in proc.stdout:
                     log.push(line.rstrip())
                 proc.wait()
-                log.push("完成,重启服务后生效")
+                if proc.returncode != 0:
+                    log.push(f"{label} 失败,退出码 {proc.returncode}")
+                return proc.returncode
+
+            def _work():
+                # 只升包不装配套浏览器 = 下次启动浏览器必挂(2026-09-25 停摆就是这么来的):
+                # 包版本要和 ms-playwright 里带编号的目录成对,所以这两步必须一起做完。
+                # Popen 也要一起丢出去:fork/exec 在事件循环线程里同样是同步开销,
+                # 而且后面那段输出泵本来就是阻塞读。
+                if _run([sys.executable, "-m", "pip", "install", "-U", "playwright"],
+                        "升级 Playwright") != 0:
+                    return
+                if _run([sys.executable, "-m", "playwright", "install", "chromium"],
+                        "下载配套浏览器") == 0:
+                    log.push("完成,重启服务后生效")
 
             await run.io_bound(_work)
 
-        ui.button("升级 Playwright", on_click=do_upgrade) \
+        ui.button("升级 Playwright(含下载浏览器)", on_click=do_upgrade) \
             .props("unelevated no-caps color=primary").classes("w-full")
         def _restart():
             """用和启动时**同一条命令**重启自己:`python ui.py`。
