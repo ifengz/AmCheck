@@ -57,7 +57,9 @@ PY
   done
   echo "依赖自检通过"
 
-  .venv/bin/playwright install chromium
+  # 旗标不能省:playwright install 默认会顺手回收"没有安装记录引用"的浏览器目录,
+  # 而服务器这台是多项目共用一个 ms-playwright 缓存,不加就可能删掉别的项目在用的版本。
+  PLAYWRIGHT_SKIP_BROWSER_GC=1 .venv/bin/playwright install chromium
 fi
 
 if [ ! -f accounts.json ]; then

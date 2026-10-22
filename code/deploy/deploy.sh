@@ -23,6 +23,14 @@ git fetch --prune origin
 git reset --hard origin/main
 ./.venv/bin/pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
+# Playwright 的包版本必须和 ~/.cache/ms-playwright 里带编号的浏览器目录成对
+# (1.60→1223、1.62→1234)。这一步以前缺失:包被升级后没人补浏览器,2026-09-25 起
+# 检测与每日跟踪全部静默停摆。装失败就当场停部署(set -e),别让"页面还打得开"
+# 掩盖住"一条都测不了"。
+# SKIP_BROWSER_GC:install 默认会回收"没有安装记录引用"的浏览器目录,而这台服务器是
+# 多项目共用 /www/.cache/ms-playwright,不加这个旗标就可能顺手删掉 amvc 在用的那套。
+PLAYWRIGHT_SKIP_BROWSER_GC=1 ./.venv/bin/playwright install chromium
+
 # 端口跟应用保持一致:应用读 AMREVIEW_PORT(默认 8765),这里别再写死一个字面量
 PORT="${AMREVIEW_PORT:-8765}"
 APP_PATTERN="python ui.py"

@@ -45,7 +45,7 @@ orjson==3.11.5
 packaging==25.0
 pandas==2.3.3
 pillow==11.3.0
-playwright==1.60.0
+playwright==1.62.0
 propcache==0.4.1
 protobuf==6.33.6
 pyarrow==21.0.0

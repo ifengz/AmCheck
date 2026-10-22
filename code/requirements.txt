@@ -14,7 +14,11 @@ nicegui>=3.6                 # 主界面(ui.py)
 streamlit>=1.35              # 旧版界面(app.py,start.sh 的 legacy 模式)
 
 # --- 浏览器自动化 ---
-playwright>=1.45
+# 必须钉死:包版本要和 ~/.cache/ms-playwright 里带编号的浏览器目录成对
+# (1.60→1223、1.62→1234)。写成 >= 时包一旦被单独升级,浏览器就对不上号,
+# 检测会静默全挂 —— 2026-09-25 的生产停摆就是这么来的。改这里要同步跑一次
+# `playwright install chromium`(见 deploy/deploy.sh)。
+playwright==1.62.0
 
 # --- 表格导入 ---
 openpyxl>=3.1                # .xlsx/.xlsm(ZIP 容器)
